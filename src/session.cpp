@@ -314,32 +314,48 @@ bool TransferSession::startAsSender(const SessionConfig& config, const std::stri
     config_ = config;
     filename_ = filename;
 
+    std::cout << "Starting sender session..." << std::endl;
+    std::cout << "  File: " << filename << std::endl;
+    std::cout << "  Remote IP: " << config.remoteIP << std::endl;
+    std::cout << "  Remote Port: " << config.remoteControlPort << std::endl;
+
     // 初始化文件映射器
     fileMapper_ = std::make_unique<FileMapper>();
     if (!fileMapper_->openForRead(filename)) {
+        std::cerr << "ERROR: Failed to open file for reading: " << filename << std::endl;
         state_.setError("Failed to open file for reading");
         return false;
     }
+    std::cout << "  File opened successfully, size: " << fileMapper_->size() << " bytes" << std::endl;
 
     // 映射整个文件到内存
     if (!fileMapper_->mapFile()) {
+        std::cerr << "ERROR: Failed to map file to memory" << std::endl;
         state_.setError("Failed to map file to memory");
         return false;
     }
+    std::cout << "  File mapped to memory successfully" << std::endl;
 
-    // 初始化chunk管理器
-    chunkManager_ = std::make_unique<ChunkManager>(filename, config.getChunkSizeBytes());
-    if (!chunkManager_->initializeForSend()) {
+    // 初始化chunk管理器，传入已经打开的fileMapper
+    chunkManager_ = std::make_unique<ChunkManager>(filename, config.getChunkSizeBytes(), fileMapper_.get());
+    if (!chunkManager_->initializeForSend(fileMapper_.get())) {
+        std::cerr << "ERROR: Failed to initialize chunk manager" << std::endl;
         state_.setError("Failed to initialize chunk manager");
         return false;
     }
+    std::cout << "  Chunk manager initialized, total chunks: "
+              << chunkManager_->getTotalChunks() << std::endl;
 
     // 初始化控制会话
     controlSession_ = std::make_unique<ControlSession>();
     if (!controlSession_->initialize(config.remoteControlPort)) {
+        std::cerr << "ERROR: Failed to initialize control session on port "
+                  << config.remoteControlPort << std::endl;
         state_.setError("Failed to initialize control session");
         return false;
     }
+    std::cout << "  Control session initialized on port "
+              << config.remoteControlPort << std::endl;
 
     // 初始化数据服务器
     dataServer_ = std::make_unique<UdpServer>();
@@ -354,9 +370,14 @@ bool TransferSession::startAsSender(const SessionConfig& config, const std::stri
     });
 
     if (!dataServer_->start(config.localDataPort, config.workerThreads)) {
+        std::cerr << "ERROR: Failed to start data server on port "
+                  << config.localDataPort << " with " << config.workerThreads
+                  << " threads" << std::endl;
         state_.setError("Failed to start data server");
         return false;
     }
+    std::cout << "  Data server started on port " << config.localDataPort
+              << " with " << config.workerThreads << " threads" << std::endl;
 
     // 设置远程地址
     remoteAddr_ = SocketAddress(config.remoteIP, config.remoteControlPort);
@@ -370,10 +391,11 @@ bool TransferSession::startAsSender(const SessionConfig& config, const std::stri
     // 启动主线程
     mainThread_ = std::thread(&TransferSession::senderMain, this);
 
+    std::cout << "Sender session started successfully!" << std::endl;
     return true;
 }
 
-bool TransferSession::startAsReceiver(const SessionConfig& config, const std::string& filename) {
+    bool TransferSession::startAsReceiver(const SessionConfig& config, const std::string& filename) {
     config_ = config;
     filename_ = filename;
     finalFilename_ = filename;
@@ -408,6 +430,9 @@ bool TransferSession::startAsReceiver(const SessionConfig& config, const std::st
         state_.setError("Failed to start data server");
         return false;
     }
+
+    // 接收方等待握手成功后才会创建chunkManager
+    // 握手成功后会调用 performHandshakeAsReceiver，在那里创建chunkManager
 
     // 启动主动NACK监控线程
     running_ = true;
@@ -693,15 +718,8 @@ bool TransferSession::performHandshakeAsReceiver() {
                 // 检查磁盘空间
                 uint64_t freeSpace = Platform::getFreeDiskSpace(".");
 
-                // 计算实际需要的空间（考虑文件系统开销）
+                // 计算实际需要的空间
                 uint64_t requiredSpace = fileSize;
-
-                // NTFS额外开销（4KB对齐 + MFT条目等）
-#ifdef _WIN32
-                uint64_t clusterSize = 4096; // 典型NTFS簇大小
-                requiredSpace = ((fileSize + clusterSize - 1) / clusterSize) * clusterSize;
-                requiredSpace += 1024 * 1024; // 额外1MB用于元数据
-#endif
 
                 // 检查是否有足够的连续空间
                 bool accept = false;
@@ -717,18 +735,7 @@ bool TransferSession::performHandshakeAsReceiver() {
                              formatBytes(freeSpace) +
                              " (less than 100MB)";
                 } else {
-                    // 尝试预分配文件测试实际可用空间
-                    std::string testFile = Platform::getTempDirectory() + "/hruft_space_test.tmp";
-                    FileMapper testMapper;
-                    bool canAllocate = testMapper.openForWrite(testFile, 10 * 1024 * 1024); // 10MB测试
-
-                    if (!canAllocate) {
-                        reason = "Cannot allocate test file. Disk may be read-only or full.";
-                    } else {
-                        accept = true;
-                        testMapper.close();
-                        std::remove(testFile.c_str());
-                    }
+                    accept = true;
                 }
 
                 // 发送SYN_ACK
@@ -749,7 +756,12 @@ bool TransferSession::performHandshakeAsReceiver() {
 
                 // 创建临时文件验证实际空间
                 std::string tempFile = filename_ + ".hruft_tmp";
-                chunkManager_ = std::make_unique<ChunkManager>(tempFile, chunkSize);
+
+                // 为接收方创建FileMapper
+                fileMapper_ = std::make_unique<FileMapper>();
+
+                // 创建ChunkManager，传入fileMapper
+                chunkManager_ = std::make_unique<ChunkManager>(tempFile, chunkSize, fileMapper_.get());
 
                 if (!chunkManager_->initializeForReceive(fileSize, totalChunks)) {
                     state_.setError("Failed to initialize temporary file");

@@ -21,7 +21,8 @@ namespace hruft {
         return sysInfo;
     }
 
-    FileMapper::FileMapper() : fileHandle_(INVALID_HANDLE_VALUE), mapHandle_(NULL) {
+    FileMapper::FileMapper() : fileHandle_(INVALID_HANDLE_VALUE), mapHandle_(NULL),
+                                mappedData_(nullptr), mappedSize_(0), isReadOnly_(false) {
     }
 
     FileMapper::~FileMapper() {
@@ -44,6 +45,8 @@ namespace hruft {
                                   NULL);
 
         if (fileHandle_ == INVALID_HANDLE_VALUE) {
+            DWORD err = GetLastError();
+            std::cerr << "CreateFile failed with error: " << err << std::endl;
             return false;
         }
 
@@ -55,6 +58,10 @@ namespace hruft {
         }
 
         fileSize_ = static_cast<uint64_t>(size.QuadPart);
+        isReadOnly_ = true;
+
+        std::cout << "FileMapper: Opened file " << filename
+                  << " for reading, size: " << fileSize_ << " bytes" << std::endl;
         return true;
     }
 
@@ -75,6 +82,8 @@ namespace hruft {
                                   NULL);
 
         if (fileHandle_ == INVALID_HANDLE_VALUE) {
+            DWORD err = GetLastError();
+            std::cerr << "CreateFile failed with error: " << err << std::endl;
             return false;
         }
 
@@ -88,11 +97,16 @@ namespace hruft {
             return false;
         }
 
+        isReadOnly_ = false;
+
+        std::cout << "FileMapper: Opened file " << filename
+                  << " for writing, size: " << fileSize_ << " bytes" << std::endl;
         return true;
     }
 
     bool FileMapper::mapFile(uint64_t offset, uint64_t length) {
         if (!isOpen() || isMapped()) {
+            std::cerr << "FileMapper: Cannot map - file not open or already mapped" << std::endl;
             return false;
         }
 
@@ -117,9 +131,12 @@ namespace hruft {
             adjustedLength = allocationGranularity;
         }
 
+        DWORD protect = isReadOnly_ ? PAGE_READONLY : PAGE_READWRITE;
+        DWORD access = isReadOnly_ ? FILE_MAP_READ : FILE_MAP_ALL_ACCESS;
+
         mapHandle_ = CreateFileMapping(fileHandle_,
                                        NULL,
-                                       PAGE_READWRITE,
+                                       protect,
                                        0,
                                        0,
                                        NULL);
@@ -132,7 +149,7 @@ namespace hruft {
 
         // 使用对齐后的偏移和调整后的长度
         mappedData_ = static_cast<uint8_t *>(MapViewOfFile(mapHandle_,
-                                                           FILE_MAP_ALL_ACCESS,
+                                                           access,
                                                            offsetHigh,
                                                            offsetLow,
                                                            static_cast<SIZE_T>(adjustedLength)));
@@ -148,6 +165,10 @@ namespace hruft {
         // 调整指针到实际偏移位置
         mappedData_ += offsetAdjustment;
         mappedSize_ = length;
+
+        std::cout << "FileMapper: Successfully mapped file at address "
+                  << static_cast<void*>(mappedData_)
+                  << ", size: " << mappedSize_ << std::endl;
         return true;
     }
 
@@ -196,11 +217,13 @@ namespace hruft {
 
         fileSize_ = 0;
         filename_.clear();
+        isReadOnly_ = false;
     }
 
 #else // Linux/Unix implementation
 
-    FileMapper::FileMapper() : fileDescriptor_(-1) {
+    FileMapper::FileMapper() : fileDescriptor_(-1), mappedData_(nullptr),
+                               mappedSize_(0), isReadOnly_(false) {
     }
 
     FileMapper::~FileMapper() {
@@ -216,6 +239,7 @@ namespace hruft {
 
         fileDescriptor_ = open(filename.c_str(), O_RDONLY);
         if (fileDescriptor_ < 0) {
+            perror("open failed");
             return false;
         }
 
@@ -227,6 +251,10 @@ namespace hruft {
         }
 
         fileSize_ = static_cast<uint64_t>(st.st_size);
+        isReadOnly_ = true;
+
+        std::cout << "FileMapper: Opened file " << filename
+                  << " for reading, size: " << fileSize_ << " bytes" << std::endl;
         return true;
     }
 
@@ -240,6 +268,7 @@ namespace hruft {
 
         fileDescriptor_ = open(filename.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
         if (fileDescriptor_ < 0) {
+            perror("open failed");
             return false;
         }
 
@@ -250,11 +279,16 @@ namespace hruft {
             return false;
         }
 
+        isReadOnly_ = false;
+
+        std::cout << "FileMapper: Opened file " << filename
+                  << " for writing, size: " << fileSize_ << " bytes" << std::endl;
         return true;
     }
 
     bool FileMapper::mapFile(uint64_t offset, uint64_t length) {
         if (!isOpen() || isMapped()) {
+            std::cerr << "FileMapper: Cannot map - file not open or already mapped" << std::endl;
             return false;
         }
 
@@ -262,19 +296,26 @@ namespace hruft {
             length = fileSize_ - offset;
         }
 
+        int prot = isReadOnly_ ? PROT_READ : (PROT_READ | PROT_WRITE);
+
         void *addr = mmap(nullptr,
                           length,
-                          PROT_READ | PROT_WRITE,
+                          prot,
                           MAP_SHARED,
                           fileDescriptor_,
                           static_cast<off_t>(offset));
 
         if (addr == MAP_FAILED) {
+            perror("mmap failed");
+            std::cerr << "FileMapper: mmap failed for file " << filename_ << std::endl;
             return false;
         }
 
         mappedData_ = static_cast<uint8_t *>(addr);
         mappedSize_ = length;
+
+        std::cout << "FileMapper: Successfully mapped file at address " << addr
+                  << ", size: " << mappedSize_ << std::endl;
         return true;
     }
 
@@ -307,33 +348,65 @@ namespace hruft {
 
         fileSize_ = 0;
         filename_.clear();
+        isReadOnly_ = false;
     }
 
 #endif
 
-    // ChunkManager 实现
-    ChunkManager::ChunkManager(const std::string &filename, uint64_t chunkSize)
+    // ChunkManager 实现 - 修改构造函数
+    ChunkManager::ChunkManager(const std::string &filename, uint64_t chunkSize, FileMapper* externalMapper)
         : filename_(filename)
           , chunkSize_(chunkSize)
-          , fileMapper_(std::make_unique<FileMapper>()) {
+          , fileMapper_(nullptr)
+          , ownsFileMapper_(false) {
+
+        if (externalMapper) {
+            fileMapper_ = externalMapper;
+            ownsFileMapper_ = false;
+        } else {
+            fileMapper_ = new FileMapper();
+            ownsFileMapper_ = true;
+        }
     }
 
     ChunkManager::~ChunkManager() {
-        if (fileMapper_) {
-            fileMapper_->close();
+        if (ownsFileMapper_ && fileMapper_) {
+            delete fileMapper_;
         }
     }
 
-    bool ChunkManager::initializeForSend() {
-        if (!fileMapper_->openForRead(filename_)) {
-            return false;
+    bool ChunkManager::initializeForSend(FileMapper* mapper) {
+        // 如果有外部mapper，使用它
+        if (mapper && !ownsFileMapper_) {
+            fileMapper_ = mapper;
+            ownsFileMapper_ = false;
+        }
+
+        // 如果fileMapper_没有打开，则打开它
+        if (!fileMapper_->isOpen()) {
+            if (!fileMapper_->openForRead(filename_)) {
+                std::cerr << "ChunkManager: Failed to open file " << filename_ << std::endl;
+                return false;
+            }
+        }
+
+        // 如果文件没有映射，映射它（发送方需要映射整个文件用于读取）
+        if (!fileMapper_->isMapped()) {
+            if (!fileMapper_->mapFile()) {
+                std::cerr << "ChunkManager: Failed to map file " << filename_ << std::endl;
+                return false;
+            }
         }
 
         totalFileSize_ = fileMapper_->size();
+        std::cout << "ChunkManager: Using file mapper, size: " << totalFileSize_ << " bytes" << std::endl;
 
         // 计算总块数
         uint32_t totalChunks = static_cast<uint32_t>((totalFileSize_ + chunkSize_ - 1) / chunkSize_);
         chunks_.resize(totalChunks);
+
+        std::cout << "ChunkManager: Total chunks: " << totalChunks
+                  << ", chunk size: " << chunkSize_ << " bytes" << std::endl;
 
         // 初始化块信息
         for (uint32_t i = 0; i < totalChunks; ++i) {
@@ -356,13 +429,18 @@ namespace hruft {
         totalFileSize_ = totalSize;
         chunks_.resize(totalChunks);
 
-        // 创建文件
-        if (!fileMapper_->openForWrite(filename_, totalSize)) {
-            return false;
+        // 如果是外部mapper，确保它已打开
+        if (!fileMapper_->isOpen()) {
+            // 创建文件用于写入
+            if (!fileMapper_->openForWrite(filename_, totalSize)) {
+                std::cerr << "ChunkManager: Failed to create file " << filename_ << std::endl;
+                return false;
+            }
         }
 
-        // 映射整个文件
+        // 映射整个文件用于写入
         if (!fileMapper_->mapFile(0, totalSize)) {
+            std::cerr << "ChunkManager: Failed to map file " << filename_ << std::endl;
             return false;
         }
 
@@ -380,20 +458,20 @@ namespace hruft {
     }
 
     void ChunkManager::calculateChunkHash(Chunk &chunk) {
-        if (!chunkBuffer_.empty() && chunkBuffer_.size() < chunk.size) {
-            chunkBuffer_.resize(chunk.size);
+        if (!fileMapper_ || !fileMapper_->isMapped()) {
+            std::cerr << "Error: File is not mapped for hash calculation" << std::endl;
+            return;
         }
 
-        // 读取块数据
-        std::ifstream file(filename_, std::ios::binary);
-        if (!file) return;
-
-        file.seekg(chunk.offset);
-        file.read(reinterpret_cast<char *>(chunkBuffer_.data()), chunk.size);
+        // 直接从映射的内存中读取数据
+        const uint8_t* chunkData = fileMapper_->data() + chunk.offset;
 
         // 计算SHA-256
-        auto hash = Crypto::calculateSHA256(chunkBuffer_.data(), chunk.size);
+        auto hash = Crypto::calculateSHA256(chunkData, chunk.size);
         memcpy(chunk.hash, hash.data(), std::min(hash.size(), size_t(32)));
+
+        std::cout << "ChunkManager: Calculated hash for chunk " << chunk.id
+                  << " (offset: " << chunk.offset << ", size: " << chunk.size << ")" << std::endl;
     }
 
     ChunkManager::Chunk *ChunkManager::getNextChunkToSend() {

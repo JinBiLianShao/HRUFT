@@ -14,81 +14,85 @@
 
 namespace hruft {
     bool parseCommandLine(int argc, char *argv[], CommandLineArgs &args) {
-        if (argc < 2) {
-            return false;
-        }
-
-        // 默认值
-        args.mode = "";
-        args.filename = "";
-        args.remoteIP = "";
-        args.remotePort = 10000;
-        args.localDataPort = 10001;
-        args.workerThreads = 8;
-        args.chunkSizeMB = 4;
-        args.windowSize = 16;
-        args.encryptionKey = "";
-
-        // 解析短选项
-        int opt;
-        while ((opt = getopt(argc, argv, "m:f:p:t:c:w:k:h")) != -1) {
-            switch (opt) {
-                case 'm':
-                    args.mode = optarg;
-                    break;
-                case 'f':
-                    args.filename = optarg;
-                    break;
-                case 'p':
-                    args.remotePort = static_cast<uint16_t>(std::stoi(optarg));
-                    break;
-                case 't':
-                    args.workerThreads = std::stoi(optarg);
-                    break;
-                case 'c':
-                    args.chunkSizeMB = std::stoi(optarg);
-                    break;
-                case 'w':
-                    args.windowSize = std::stoi(optarg);
-                    break;
-                case 'k':
-                    args.encryptionKey = optarg;
-                    break;
-                case 'h':
-                    return false;
-                default:
-                    return false;
-            }
-        }
-
-        // 解析剩余的选项（-ip参数）
-        for (int i = optind; i < argc; i++) {
-            if (strcmp(argv[i], "-ip") == 0 && i + 1 < argc) {
-                args.remoteIP = argv[i + 1];
-                i++;
-            } else if (strncmp(argv[i], "--key=", 6) == 0) {
-                args.encryptionKey = argv[i] + 6;
-            }
-        }
-
-        // 验证必需参数
-        if (args.mode.empty()) {
-            std::cerr << "Error: Mode is required (-m send/recv)" << std::endl;
-            return false;
-        }
-
-        if (args.filename.empty()) {
-            std::cerr << "Error: Filename is required (-f)" << std::endl;
-            return false;
-        }
-
-        if (args.mode == "send" && args.remoteIP.empty()) {
-            std::cerr << "Error: Remote IP is required for send mode (-ip)" << std::endl;
-            return false;
-        }
-
-        return true;
+    if (argc < 2) {
+        return false;
     }
+
+    // 默认值
+    args.mode = "";
+    args.filename = "";
+    args.remoteIP = "";
+    args.remotePort = 10000;
+    args.localDataPort = 10001;
+    args.workerThreads = 8;
+    args.chunkSizeMB = 4;
+    args.windowSize = 16;
+    args.encryptionKey = "";
+
+    // 修改这里：添加 'i' 选项
+    int opt;
+    while ((opt = getopt(argc, argv, "m:f:i:p:t:c:w:k:h")) != -1) {
+        switch (opt) {
+            case 'm':
+                args.mode = optarg;
+                break;
+            case 'f':
+                args.filename = optarg;
+                break;
+            case 'i':  // 添加这个
+                args.remoteIP = optarg;
+                break;
+            case 'p':
+                args.remotePort = static_cast<uint16_t>(std::stoi(optarg));
+                break;
+            case 't':
+                args.workerThreads = std::stoi(optarg);
+                break;
+            case 'c':
+                args.chunkSizeMB = std::stoi(optarg);
+                break;
+            case 'w':
+                args.windowSize = std::stoi(optarg);
+                break;
+            case 'k':
+                args.encryptionKey = optarg;
+                break;
+            case 'h':
+                return false;
+            default:
+                return false;
+        }
+    }
+
+    // 删除下面的代码，因为我们已经用 -i 选项处理了
+    // // 解析剩余的选项（-ip参数）
+    // for (int i = optind; i < argc; i++) {
+    //     if (strcmp(argv[i], "-ip") == 0 && i + 1 < argc) {
+    //         args.remoteIP = argv[i + 1];
+    //         i++;
+    //     } else if (strncmp(argv[i], "--key=", 6) == 0) {
+    //         args.encryptionKey = argv[i] + 6;
+    //     }
+    // }
+
+    // 验证必需参数
+    if (args.mode.empty()) {
+        std::cerr << "Error: Mode is required (-m send/recv)" << std::endl;
+        return false;
+    }
+
+    if (args.filename.empty()) {
+        std::cerr << "Error: Filename is required (-f)" << std::endl;
+        return false;
+    }
+
+    if (args.mode == "send" && args.remoteIP.empty()) {
+        std::cerr << "Error: Remote IP is required for send mode (-i)" << std::endl;  // 修改错误信息
+        return false;
+    }
+
+    return true;
+}
 
     bool parseCommandLineArgs(const CommandLineArgs &cliArgs, SessionConfig &config) {
         // 基础配置
@@ -158,7 +162,7 @@ namespace hruft {
         std::cout << "Required options:" << std::endl;
         std::cout << "  -m <mode>       Operation mode (send/recv)" << std::endl;
         std::cout << "  -f <filename>   File to send or receive" << std::endl;
-        std::cout << "  -ip <address>   Remote IP address (send mode only)" << std::endl;
+        std::cout << "  -i <address>    Remote IP address (send mode only)" << std::endl;  // 修改这里
         std::cout << std::endl;
         std::cout << "Performance options:" << std::endl;
         std::cout << "  -t <threads>    Worker thread count (default: 8)" << std::endl;
@@ -170,7 +174,7 @@ namespace hruft {
         std::cout << "  -k <key>        Encryption key (optional)" << std::endl;
         std::cout << std::endl;
         std::cout << "Examples:" << std::endl;
-        std::cout << "  Send file:      hruft -m send -f bigfile.iso -ip 192.168.1.100 -t 16" << std::endl;
+        std::cout << "  Send file:      hruft -m send -f bigfile.iso -i 192.168.1.100 -t 16" << std::endl;  // 修改这里
         std::cout << "  Receive file:   hruft -m recv -f received.iso -t 8" << std::endl;
         std::cout << std::endl;
         std::cout << "Performance tips:" << std::endl;

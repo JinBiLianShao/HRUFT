@@ -59,6 +59,7 @@ namespace hruft {
         uint64_t fileSize_ = 0;
         uint8_t *mappedData_ = nullptr;
         uint64_t mappedSize_ = 0;
+        bool isReadOnly_ = false;
 
 #ifdef _WIN32
         HANDLE fileHandle_ = INVALID_HANDLE_VALUE;
@@ -95,12 +96,13 @@ namespace hruft {
             bool urgent; // 是否紧急（序号跳跃大）
         };
 
-        ChunkManager(const std::string &filename, uint64_t chunkSize);
+        // 修改构造函数，可以接受外部FileMapper
+        ChunkManager(const std::string &filename, uint64_t chunkSize, FileMapper* externalMapper = nullptr);
 
         ~ChunkManager();
 
         // 初始化用于发送
-        bool initializeForSend();
+        bool initializeForSend(FileMapper* mapper = nullptr);
 
         // 初始化用于接收
         bool initializeForReceive(uint64_t totalSize, uint32_t totalChunks);
@@ -145,6 +147,15 @@ namespace hruft {
         // 获取文件大小
         uint64_t getFileSize() const { return totalFileSize_; }
 
+        // 设置外部FileMapper
+        void setFileMapper(FileMapper* mapper) {
+            if (ownsFileMapper_ && fileMapper_) {
+                delete fileMapper_;
+            }
+            fileMapper_ = mapper;
+            ownsFileMapper_ = false;
+        }
+
     private:
         void calculateChunkHash(Chunk &chunk);
 
@@ -160,7 +171,8 @@ namespace hruft {
         uint64_t chunkSize_;
         uint64_t totalFileSize_ = 0;
         std::vector<Chunk> chunks_;
-        std::unique_ptr<FileMapper> fileMapper_;
+        FileMapper* fileMapper_; // 改为指针，可能由外部拥有
+        bool ownsFileMapper_;    // 标记是否拥有FileMapper所有权
         std::vector<uint8_t> chunkBuffer_; // 用于计算哈希的缓冲区
 
         uint32_t nextChunkToSend_ = 0;
