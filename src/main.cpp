@@ -443,7 +443,7 @@ struct TransferStatistics {
         ss << "  最低速度: " << (min_speed_mbps < std::numeric_limits<double>::max() ? min_speed_mbps : 0) << " Mbps" << std::endl;
         ss << std::endl;
 
-        ss << "  UDT原始包统计（包含所有包类型）:" << std::endl;
+        ss << "  UDT原始包统计（包含所有包类型/数据源来自于UDT4库内部结构体统计）:" << std::endl;
         ss << "    总发送包数: " << pktSentTotal << " (数据包+控制包)" << std::endl;
         ss << "    总接收包数: " << pktRecvTotal << " (数据包+控制包)" << std::endl;
         ss << "    发送端丢失数据包: " << pktSndLossTotal << std::endl;
@@ -454,7 +454,7 @@ struct TransferStatistics {
         ss << "    发送NAK包数: " << pktSentNAKTotal << std::endl;
         ss << "    接收NAK包数: " << pktRecvNAKTotal << std::endl;
         if (estimated_data_packets > 0) {
-            ss << "    估计的数据包数: " << estimated_data_packets << " (基于文件大小和MSS)" << std::endl;
+            ss << "    估计的数据包数: " << estimated_data_packets << " (自己算的，基于文件大小和MSS)" << std::endl;
         }
         ss << std::endl;
 
