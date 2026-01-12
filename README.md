@@ -1,240 +1,325 @@
 # HRUFT - 高性能可靠UDP文件传输系统
 
-## 概述
+![Build Status](https://img.shields.io/badge/build-passing-brightgreen)
+![License](https://img.shields.io/badge/license-MIT-blue)
+![C++ Version](https://img.shields.io/badge/C++-17-blue)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey)
 
-HRUFT是一个基于UDP的高性能可靠文件传输系统，旨在为高延迟网络环境和大文件传输提供优化的解决方案。系统采用C++17开发，支持跨平台（Linux/Windows）部署，提供完整的数据可靠性保证和传输统计功能。
+HRUFT（High-performance Reliable UDP File Transfer）是一个基于UDT协议的高性能可靠文件传输系统，专为高延迟网络和大文件传输场景设计。
 
-## 核心特性
+## ✨ 主要特性
 
-- **基于UDP的高性能传输**：在UDP基础上实现可靠传输，避免TCP在高延迟环境下的性能瓶颈
-- **自适应传输参数**：支持动态调整MSS（最大分段大小）和窗口大小以适应不同网络条件
-- **端到端数据完整性校验**：使用MD5校验确保文件传输的完整性
-- **详细的传输统计**：实时监控传输速度、丢包率、重传率等关键指标
-- **跨平台支持**：支持Linux和Windows平台，提供统一的编译和使用体验
-- **JSON格式进度报告**：便于与其他系统集成和自动化监控
+- **高性能传输**：基于UDP的可靠传输，避免TCP在高延迟环境下的性能瓶颈
+- **自适应配置**：支持动态调整MSS和窗口大小以适应不同网络条件
+- **端到端校验**：使用MD5校验确保文件传输的完整性
+- **详细统计**：提供全面的传输统计和网络分析指标
+- **跨平台支持**：支持Windows和Linux平台
+- **JSON格式输出**：便于系统集成和自动化监控
+- **智能网络评估**：自动评估网络质量并提供优化建议
 
-## 系统架构
+## 📦 系统要求
 
-### 传输模型
-HRUFT采用两级传输模型：
-1. **控制平面**：负责握手协商、传输参数同步
-2. **数据平面**：负责实际文件数据的传输
+### 操作系统
+- Windows 7/8/10/11
+- Linux (Ubuntu, CentOS, Debian等)
 
-### 可靠性机制
-- 基于UDT（UDP-based Data Transfer）协议的可靠传输
-- 支持数据包重传和流量控制
-- 提供完整的丢包检测和恢复机制
+### 编译器
+- GCC 7.0+ (Linux)
+- MinGW-w64 或 Visual Studio 2017+ (Windows)
 
-## 快速开始
+### 依赖库
+- UDT库（需要自行导入）
+- 标准C++17库
 
-### 构建项目
+## 🚀 快速开始
 
+### 1. 克隆项目
 ```bash
-# 创建构建目录
-mkdir build && cd build
+git clone https://github.com/JinBiLianShao/HRUFT.git
+cd hruft
+```
 
-# 配置CMake（Linux示例）
-cmake .. -DTARGET_OS=linux -DCOMPILER_TARGET=x86 -DTARGET_TYPE=executable
-
-# 编译
+### 2. 构建项目
+```bash
+mkdir build
+cd build
+cmake .. （根据系统要求选择）
 make -j4
 ```
 
-### 使用示例
-
-**发送文件：**
+### 3. 发送文件
 ```bash
+# Linux
 ./hruft send <目标IP> <端口> <文件路径> [选项]
-示例：./hruft send 192.168.1.100 9000 /path/to/large_file.iso --mss 1500 --window 1048576
+
+# Windows
+hruft.exe send <目标IP> <端口> <文件路径> [选项]
 ```
 
-**接收文件：**
+### 4. 接收文件
 ```bash
+# Linux
 ./hruft recv <监听端口> <保存路径> [选项]
-示例：./hruft recv 9000 /path/to/save/received_file.iso
+
+# Windows
+hruft.exe recv <监听端口> <保存路径> [选项]
 ```
 
-## 命令行参数
+## 📖 详细使用指南
 
-### 发送端参数
-| 参数 | 描述 | 默认值 | 必填 |
-|------|------|--------|------|
-| mode | 传输模式（send/recv） | - | 是 |
-| ip | 目标服务器IP地址 | - | 是 |
-| port | 目标端口 | - | 是 |
-| filepath | 要发送的文件路径 | - | 是 |
-| --mss | 最大分段大小（字节） | 1500 | 否 |
-| --window | 传输窗口大小（字节） | 1048576 | 否 |
-| --detailed | 启用详细统计 | false | 否 |
-
-### 接收端参数
-| 参数 | 描述 | 默认值 | 必填 |
-|------|------|--------|------|
-| mode | 传输模式（recv） | - | 是 |
-| port | 监听端口 | - | 是 |
-| savepath | 文件保存路径 | - | 是 |
-| --detailed | 启用详细统计 | false | 否 |
-
-## 传输统计
-
-HRUFT提供全面的传输统计信息，包括：
-
-### 实时监控指标
-- 传输进度百分比
-- 当前传输速度（Mbps）
-- 平均传输速度（Mbps）
-- 最大/最小传输速度
-- 已传输字节数/总字节数
-- 预计剩余时间
-
-### 网络质量指标
-- 总发送/接收包数
-- 发送端/接收端丢包数
-- 丢包率（%）
-- 重传包数
-- 重传率（%）
-- 传输效率（有效包/总包数）
-
-### 输出格式
-统计信息以JSON格式输出，便于解析和集成：
-```json
-{
-  "type": "statistics",
-  "total_bytes": 1073741824,
-  "transferred_bytes": 536870912,
-  "completion_percentage": 50.00,
-  "average_speed_mbps": 85.24,
-  "max_speed_mbps": 120.50,
-  "min_speed_mbps": 45.30,
-  "packet_stats": {
-    "pktSentTotal": 10000,
-    "pktRecvTotal": 9980,
-    "pktSndLossTotal": 20,
-    "loss_rate": 0.20
-  },
-  "efficiency_level": "excellent",
-  "suggestions": "Network conditions are good."
-}
-```
-
-## 构建选项
-
-CMake构建系统支持多种配置选项：
-
-| 选项 | 描述 | 可选值 | 默认值 |
-|------|------|--------|--------|
-| TARGET_OS | 目标操作系统 | linux, windows | linux |
-| COMPILER_TARGET | 目标架构 | x86, arm32, arm64 | x86 |
-| TARGET_TYPE | 目标类型 | executable, static, shared | executable |
-| ENABLE_OPENMP | 启用OpenMP并行 | ON, OFF | OFF |
-| PUBLIC_PACKAGE_DIR | 外部包目录路径 | 路径或"NO" | NO |
-
-### 交叉编译示例
+### 发送端命令
 ```bash
-# ARM64目标
+hruft send <ip> <port> <filepath> [选项]
+```
+
+**参数说明：**
+
+| 参数 | 描述 | 默认值 | 必填 |
+|------|------|--------|------|
+| `ip` | 目标服务器IP地址 | - | 是 |
+| `port` | 目标端口 | - | 是 |
+| `filepath` | 要发送的文件路径 | - | 是 |
+| `--mss` | 最大分段大小（字节） | 1500 | 否 |
+| `--window` | 传输窗口大小（字节） | 1048576 | 否 |
+| `--detailed` | 启用详细统计输出 | false | 否 |
+
+
+**示例：**
+```bash
+hruft send 192.168.1.100 9000 ./large_file.iso --mss 1024 --window 104857600 --detailed
+```
+
+### 接收端命令
+```bash
+hruft recv <port> <savepath> [选项]
+```
+
+**参数说明：**
+
+| 参数 | 描述 | 默认值 | 必填 |
+|------|------|--------|------|
+| `port` | 监听端口 | - | 是 |
+| `savepath` | 文件保存路径 | - | 是 |
+| `--detailed` | 启用详细统计输出 | false | 否 |
+
+**示例：**
+```bash
+hruft recv 9000 ./received_file.iso --detailed
+```
+
+## 🔧 高级配置
+
+### CMake构建选项
+
+| 选项 | 描述         | 可选值                        | 默认值 |
+|------|------------|----------------------------|--------|
+| `DTARGET_OS` | 目标操作系统     | linux, windows             | linux |
+| `DCOMPILER_TARGET` | 目标架构       | x86, arm32, arm64          | x86 |
+| `DTARGET_TYPE` | 目标类型       | executable, static, shared | executable |
+| `DENABLE_OPENMP` | 启用OpenMP并行 | ON, OFF                    | OFF |
+| `DPUBLIC_PACKAGE_DIR` | 外部包/库目录路径  | 路径或"NO"                    | NO |
+| `DCMAKE_BUILD_TYPE` | 构建类型     | Release或Debug              | Debug |
+
+**构建示例：**
+```bash
+# ARM64架构
 cmake .. -DCOMPILER_TARGET=arm64 -DTARGET_TYPE=executable
 
 # Windows目标（使用MinGW）
-cmake .. -DTARGET_OS=windows -DTARGET_TYPE=executable
+cmake .. -DTARGET_OS=windows -DCOMPILER_TARGET=x86 -DPUBLIC_PACKAGE_DIR=/home/lsx/Code/udt4/src -DTARGET_TYPE=executable -DCMAKE_BUILD_TYPE=Release
 
 # 静态库构建
 cmake .. -DTARGET_TYPE=static
 ```
 
-## 协议设计
+### 传输参数调优
 
-### 握手协议
-传输开始前，发送端和接收端通过握手协议协商传输参数：
-- 文件大小
-- MD5校验值
-- MSS（最大分段大小）
-- 窗口大小
+1. **MSS（最大分段大小）**
+    - 建议值：1024-1500字节
+    - 应根据网络MTU调整，避免IP分片
 
-### 数据格式
-所有协议结构体使用紧凑内存布局（`#pragma pack(push, 1)`）确保跨平台兼容性。
+2. **窗口大小**
+    - 默认：1MB（1048576字节）
+    - 高延迟网络建议增大窗口
+    - 公式：窗口大小 ≈ 带宽 × RTT
 
-## 开发指南
+3. **流控制**
+    - 系统自动计算流控制窗口
+    - 最小值为25600个包
 
-### 项目结构
+## 📊 统计信息说明
+
+HRUFT提供全面的传输统计信息，帮助用户评估网络状况和传输效率。
+
+### 实时进度报告
+```json
+{
+  "type": "progress",
+  "percent": 50,
+  "current": 536870912,
+  "total": 1073741824,
+  "speed_mbps": 256.42,
+  "elapsed_seconds": 2,
+  "average_speed_mbps": 250.18,
+  "remaining_bytes": 536870912
+}
+```
+
+### 完整统计报告
+HRUFT提供两种统计报告：
+
+1. **JSON格式**：便于程序解析和集成
+2. **文本格式**：便于人类阅读
+
+#### 关键统计指标
+
+**速度统计：**
+- 平均速度：整个传输过程的平均速度
+- 最高速度：传输过程中达到的最高瞬时速度
+- 最低速度：传输过程中的最低瞬时速度
+- 当前速度：最后一次测量的瞬时速度
+
+**UDT原始包统计：**
+- 总发送包数：包括数据包和控制包
+- 总接收包数：包括数据包和控制包
+- 数据包丢失数：发送端和接收端分别统计
+- 重传包数：需要重传的数据包数
+- 控制包统计：ACK和NAK包的数量
+
+**网络分析指标：**
+- 数据包丢包率：丢失的数据包比例
+- 控制包开销：控制包占总体流量的比例
+- 网络传输效率：有效数据传输比例
+- 数据完整性评分：基于丢包率和重传率计算的评分
+
+### 网络质量评估
+系统会根据统计数据自动评估网络质量：
+
+| 质量等级 | 丢包率 | 说明 |
+|----------|--------|------|
+| Excellent | < 2% | 网络状况极佳 |
+| Good | 2%-5% | 网络状况良好 |
+| Fair | 5%-10% | 网络状况一般 |
+| Poor | > 10% | 网络状况较差 |
+
+## 🏗️ 项目结构
+
 ```
 hruft/
-├── CMakeLists.txt          # 构建配置文件
-├── src/                    # 源代码目录
-├── include/                # 头文件目录
-├── lib/                    # 第三方库目录
-├── external/               # 外部依赖目录
-└── build/                  # 构建目录
+├── CMakeLists.txt          # CMake构建配置文件
+├── README.md              # 项目说明文档
+├── main.cpp              # 主程序文件
+├── udt4/                  # UDT4网络库
+└── build/                # 构建目录
 ```
 
-### 依赖项
-- UDT库（UDP-based Data Transfer）
-- 标准C++17库
-- 跨平台网络库（Winsock2 / BSD sockets）
+### 核心模块
 
-### 扩展开发
-如需扩展功能，可修改以下部分：
-- 在`protocol/`目录中添加新的协议定义
-- 在`net/`目录中扩展网络功能
-- 在`security/`目录中增强安全功能
+1. **传输统计模块** (`TransferStatistics`类)
+    - 实时速度计算和统计
+    - UDT性能数据收集
+    - 网络质量评估
 
-## 性能优化建议
+2. **网络传输模块**
+    - UDT socket管理
+    - 自适应参数调整
+    - 可靠数据传输
 
-1. **调整窗口大小**：根据网络延迟调整传输窗口大小，高延迟网络建议增大窗口
-2. **优化MSS**：根据MTU（最大传输单元）调整MSS，避免IP分片
-3. **并行传输**：对于特大文件，可考虑分块并行传输
-4. **内存管理**：使用内存映射文件（mmap）减少内存拷贝开销
+3. **文件处理模块**
+    - 大文件分块传输
+    - MD5校验计算
+    - 进度报告生成
 
-## 故障排除
+## 🔍 故障排除
 
 ### 常见问题
 
-1. **连接失败**
-    - 检查防火墙设置
-    - 确认目标端口是否开放
-    - 验证IP地址和端口号
+#### 1. 连接失败
+- 检查目标IP和端口是否正确
+- 确认防火墙设置
+- 验证网络连通性
 
-2. **传输速度慢**
-    - 检查网络带宽限制
-    - 调整传输窗口大小
-    - 检查是否有网络丢包
+#### 2. 传输速度慢
+- 调整窗口大小参数
+- 检查网络带宽限制
+- 考虑使用更大的MSS值
 
-3. **校验失败**
-    - 确保发送和接收的文件路径正确
-    - 检查磁盘空间是否充足
-    - 验证网络传输过程中是否有数据损坏
+#### 3. 统计信息异常
+- 确认使用了`--detailed`参数
+- 检查网络稳定性
+- 验证文件完整性
 
-### 调试信息
-启用详细统计模式可获取更多调试信息：
+#### 4. 编译错误
+- 确认已安装所有依赖
+- 检查编译器版本
+- 验证CMake配置
+
+### 调试模式
+启用详细统计可以获取更多调试信息：
 ```bash
-./hruft send 192.168.1.100 9000 file.iso --detailed
+hruft send 192.168.1.100 9000 file.iso --detailed
 ```
 
-## 许可证
 
-本项目采用MIT许可证。详见LICENSE文件。
+## 🤝 贡献指南
 
-## 贡献指南
+### 提交问题
+1. 在GitHub Issues中搜索相关问题
+2. 如未找到，创建新Issue并详细描述问题
+3. 包括操作系统、编译器和复现步骤
 
-欢迎提交问题报告和功能请求。提交代码前请确保：
-1. 代码符合项目编码规范
-2. 添加必要的测试用例
-3. 更新相关文档
+### 提交代码
+1. Fork项目到个人账户
+2. 创建功能分支
+3. 提交清晰的提交信息
+4. 创建Pull Request
 
-## 版本历史
+### 代码规范
+- 遵循C++17标准
+- 使用有意义的变量名
+- 添加必要的注释
+- 保持代码风格一致
 
-- v1.0.0 (初始版本)
-    - 基于UDP的可靠文件传输
-    - 支持跨平台编译和运行
-    - 完整的传输统计功能
-    - 数据完整性校验
+## 📄 许可证
 
-## 技术支持
+本项目采用MIT许可证。详见[LICENSE](LICENSE)文件。
 
-如有技术问题，请：
-1. 查看项目文档
-2. 检查已存在的问题报告
-3. 提交新的Issue
+## 🙏 致谢
+
+- **UDT项目**：提供高性能UDP传输协议
+- **CMake社区**：跨平台构建系统
+- **所有贡献者**：感谢每一位为项目做出贡献的人
+
+## 📞 联系方式
+
+- **项目维护者**：连思鑫
+- **问题反馈**：[GitHub Issues](https://github.com/JinBiLianShao/HRUFT/issues)
+- **邮箱**：2013182991@qq.com  |  jinbilianshao@gmail.com
 
 ---
 
+## ⚡ 快速参考表
+
+| 命令 | 说明 |
+|------|------|
+| `hruft send <ip> <port> <file> --detailed` | 发送文件并显示详细统计 |
+| `hruft recv <port> <save> --detailed` | 接收文件并显示详细统计 |
+| `--mss 1024` | 设置最大分段大小为1024字节 |
+| `--window 104857600` | 设置传输窗口为100MB |
+
+| 统计项 | 理想值 | 说明 |
+|--------|--------|------|
+| 丢包率 | < 2% | 网络状况良好 |
+| 控制开销 | < 10% | 控制包开销合理 |
+| 传输效率 | > 95% | 数据传输高效 |
+| 完整性评分 | > 90 | 数据完整性好 |
+
+---
+
+**提示**：对于高延迟网络（>100ms RTT），建议增大窗口大小以获得更好的性能。
+
 **注意**：本系统专为可控网络环境设计，不适用于需要NAT穿透或公网P2P传输的场景。
+
+---
+
+⭐ **如果这个项目对你有帮助，请给它一个Star！** ⭐
