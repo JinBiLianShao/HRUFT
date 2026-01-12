@@ -1,391 +1,240 @@
-# 高性能可靠 UDP 文件传输系统
+# HRUFT - 高性能可靠UDP文件传输系统
 
-**HRUFT（High-performance Reliable UDP File Transfer）**
-**完整设计报告（工程版）**
+## 概述
 
----
+HRUFT是一个基于UDP的高性能可靠文件传输系统，旨在为高延迟网络环境和大文件传输提供优化的解决方案。系统采用C++17开发，支持跨平台（Linux/Windows）部署，提供完整的数据可靠性保证和传输统计功能。
 
-## 0. 设计目标与约束
+## 核心特性
 
-### 0.1 设计目标
+- **基于UDP的高性能传输**：在UDP基础上实现可靠传输，避免TCP在高延迟环境下的性能瓶颈
+- **自适应传输参数**：支持动态调整MSS（最大分段大小）和窗口大小以适应不同网络条件
+- **端到端数据完整性校验**：使用MD5校验确保文件传输的完整性
+- **详细的传输统计**：实时监控传输速度、丢包率、重传率等关键指标
+- **跨平台支持**：支持Linux和Windows平台，提供统一的编译和使用体验
+- **JSON格式进度报告**：便于与其他系统集成和自动化监控
 
-HRUFT 是一个 **基于 UDP 的高性能、强可靠、大文件传输工具**，目标：
+## 系统架构
 
-* 在 **高时延（High RTT）网络环境** 下仍能接近链路带宽上限
-* 支持 **超大文件（≥ TB 级）**
-* 提供 **强一致性校验 + 安全防护**
-* **跨平台（Linux / Windows）**
-* **纯命令行工具**
-* 使用 **C++17**
-* **不依赖重量级第三方库**
+### 传输模型
+HRUFT采用两级传输模型：
+1. **控制平面**：负责握手协商、传输参数同步
+2. **数据平面**：负责实际文件数据的传输
 
----
+### 可靠性机制
+- 基于UDT（UDP-based Data Transfer）协议的可靠传输
+- 支持数据包重传和流量控制
+- 提供完整的丢包检测和恢复机制
 
-### 0.2 明确不做的事情（边界）
+## 快速开始
 
-* ❌ 不做 NAT 穿透
-* ❌ 不做公网 P2P
-* ❌ 不追求 TCP 兼容
-* ❌ 不依赖系统 TCP 拥塞控制
-
----
-
-## 1. 总体架构设计
-
-### 1.1 架构总览
-
-```
-+------------------------------------------------+
-|                    HRUFT                       |
-+------------------------------------------------+
-| CLI Interface                                  |
-+------------------------------------------------+
-| Session Manager                                |
-+------------------------------------------------+
-| Control Plane (UDP : 10000)                    |
-|  - handshake                                   |
-|  - chunk scheduling                            |
-|  - ACK / NACK                                  |
-+------------------------------------------------+
-| Data Plane (UDP : 10001 ~ 10001+N)             |
-|  - parallel chunk transfer                     |
-|  - packet-level reliability                    |
-+------------------------------------------------+
-| Memory Manager                                 |
-|  - mmap / MapViewOfFile                        |
-+------------------------------------------------+
-| Security Layer                                 |
-|  - AES-CTR                                     |
-|  - HMAC-SHA256                                 |
-+------------------------------------------------+
-| Platform Abstraction                           |
-|  - socket / file / time                        |
-+------------------------------------------------+
-```
-
----
-
-### 1.2 核心思想总结
-
-| 维度    | 设计选择                 |
-| ----- | -------------------- |
-| 传输模型  | Chunk + Packet 两级    |
-| 并行度   | Chunk 级并行            |
-| 可靠性   | 应用层 ARQ              |
-| 高时延优化 | Chunk Sliding Window |
-| 大文件   | mmap 零拷贝             |
-| 安全    | AEAD 风格              |
-
----
-
-## 2. 命令行接口（CLI）
-
-### 2.1 应用名
+### 构建项目
 
 ```bash
-hruft
+# 创建构建目录
+mkdir build && cd build
+
+# 配置CMake（Linux示例）
+cmake .. -DTARGET_OS=linux -DCOMPILER_TARGET=x86 -DTARGET_TYPE=executable
+
+# 编译
+make -j4
 ```
 
----
+### 使用示例
 
-### 2.2 参数定义
-
-| 参数     | 说明             | 示例                |
-| ------ | -------------- | ----------------- |
-| `-m`   | 模式：send / recv | `-m send`         |
-| `-f`   | 文件路径           | `-f ./big.iso`    |
-| `-i`   | 目标 IP（send）    | `-i 192.168.1.10` |
-| `-t`   | 工作线程数          | `-t 8`            |
-| `-c`   | Chunk 大小（MB）   | `-c 4`            |
-| `-w`   | Chunk 窗口大小     | `-w 16`           |
-| `-p`   | 起始数据端口         | `-p 10001`        |
-| `--key` | 加密密钥           | `--key secret`    |
-
----
-
-## 3. 协议设计（Protocol Specification）
-
-### 3.1 基础约定
-
-* **小端序**
-* 所有结构体使用：
-
-```cpp
-#pragma pack(push, 1)
-#pragma pack(pop)
+**发送文件：**
+```bash
+./hruft send <目标IP> <端口> <文件路径> [选项]
+示例：./hruft send 192.168.1.100 9000 /path/to/large_file.iso --mss 1500 --window 1048576
 ```
 
----
-
-## 3.2 控制平面协议（Port 10000）
-
-### 3.2.1 控制类型
-
-```cpp
-enum class ControlType : uint8_t {
-    SYN,
-    SYN_ACK,
-    CHUNK_META,
-    CHUNK_CONFIRM,
-    CHUNK_RETRY,
-    FILE_DONE
-};
+**接收文件：**
+```bash
+./hruft recv <监听端口> <保存路径> [选项]
+示例：./hruft recv 9000 /path/to/save/received_file.iso
 ```
 
----
+## 命令行参数
 
-### 3.2.2 ControlPacket 布局
+### 发送端参数
+| 参数 | 描述 | 默认值 | 必填 |
+|------|------|--------|------|
+| mode | 传输模式（send/recv） | - | 是 |
+| ip | 目标服务器IP地址 | - | 是 |
+| port | 目标端口 | - | 是 |
+| filepath | 要发送的文件路径 | - | 是 |
+| --mss | 最大分段大小（字节） | 1500 | 否 |
+| --window | 传输窗口大小（字节） | 1048576 | 否 |
+| --detailed | 启用详细统计 | false | 否 |
 
-```cpp
-struct ControlPacket {
-    uint32_t magic;      // 'HRUF'
-    uint16_t version;    // 0x0001
-    ControlType type;
-    uint32_t chunkId;
-    uint16_t payloadLen;
-    uint8_t  payload[1024];
-};
+### 接收端参数
+| 参数 | 描述 | 默认值 | 必填 |
+|------|------|--------|------|
+| mode | 传输模式（recv） | - | 是 |
+| port | 监听端口 | - | 是 |
+| savepath | 文件保存路径 | - | 是 |
+| --detailed | 启用详细统计 | false | 否 |
+
+## 传输统计
+
+HRUFT提供全面的传输统计信息，包括：
+
+### 实时监控指标
+- 传输进度百分比
+- 当前传输速度（Mbps）
+- 平均传输速度（Mbps）
+- 最大/最小传输速度
+- 已传输字节数/总字节数
+- 预计剩余时间
+
+### 网络质量指标
+- 总发送/接收包数
+- 发送端/接收端丢包数
+- 丢包率（%）
+- 重传包数
+- 重传率（%）
+- 传输效率（有效包/总包数）
+
+### 输出格式
+统计信息以JSON格式输出，便于解析和集成：
+```json
+{
+  "type": "statistics",
+  "total_bytes": 1073741824,
+  "transferred_bytes": 536870912,
+  "completion_percentage": 50.00,
+  "average_speed_mbps": 85.24,
+  "max_speed_mbps": 120.50,
+  "min_speed_mbps": 45.30,
+  "packet_stats": {
+    "pktSentTotal": 10000,
+    "pktRecvTotal": 9980,
+    "pktSndLossTotal": 20,
+    "loss_rate": 0.20
+  },
+  "efficiency_level": "excellent",
+  "suggestions": "Network conditions are good."
+}
 ```
 
----
+## 构建选项
 
-### 3.2.3 控制流语义
+CMake构建系统支持多种配置选项：
 
-| 类型            | 作用                 |
-| ------------- | ------------------ |
-| SYN           | 文件名 / 大小 / chunk 数 |
-| SYN_ACK       | 磁盘空间确认             |
-| CHUNK_META    | chunk hash         |
-| CHUNK_CONFIRM | chunk 校验成功         |
-| CHUNK_RETRY   | chunk 丢包位图         |
-| FILE_DONE     | 整体完成               |
+| 选项 | 描述 | 可选值 | 默认值 |
+|------|------|--------|--------|
+| TARGET_OS | 目标操作系统 | linux, windows | linux |
+| COMPILER_TARGET | 目标架构 | x86, arm32, arm64 | x86 |
+| TARGET_TYPE | 目标类型 | executable, static, shared | executable |
+| ENABLE_OPENMP | 启用OpenMP并行 | ON, OFF | OFF |
+| PUBLIC_PACKAGE_DIR | 外部包目录路径 | 路径或"NO" | NO |
 
----
+### 交叉编译示例
+```bash
+# ARM64目标
+cmake .. -DCOMPILER_TARGET=arm64 -DTARGET_TYPE=executable
 
-## 3.3 数据平面协议（Port 10001+）
+# Windows目标（使用MinGW）
+cmake .. -DTARGET_OS=windows -DTARGET_TYPE=executable
 
-### 3.3.1 DataPacket 布局（核心）
-
-```cpp
-struct DataPacket {
-    uint32_t magic;
-    uint16_t version;
-    uint32_t chunkId;
-    uint32_t seq;
-    uint64_t offset;     // 文件绝对偏移
-    uint16_t dataLen;
-    uint16_t flags;
-    uint32_t crc32;
-    uint8_t  data[];
-};
+# 静态库构建
+cmake .. -DTARGET_TYPE=static
 ```
 
----
+## 协议设计
 
-### 3.3.2 flags 定义
+### 握手协议
+传输开始前，发送端和接收端通过握手协议协商传输参数：
+- 文件大小
+- MD5校验值
+- MSS（最大分段大小）
+- 窗口大小
 
-| Flag | 含义          |
-| ---- | ----------- |
-| 0x01 | LAST_PACKET |
-| 0x02 | RETRANSMIT  |
+### 数据格式
+所有协议结构体使用紧凑内存布局（`#pragma pack(push, 1)`）确保跨平台兼容性。
 
----
+## 开发指南
 
-## 4. 高时延优化设计（核心价值）
-
-### 4.1 Chunk Sliding Window
-
-* 同时在飞多个 Chunk
-* Chunk 完成顺序 ≠ Chunk 发送顺序
-* 控制线程统一调度
-
-```
-Window = [C5 C6 C7 C8 C9 C10 ...]
-```
-
----
-
-### 4.2 与 TCP 的本质差异
-
-| TCP           | HRUFT        |
-| ------------- | ------------ |
-| packet window | chunk window |
-| 顺序强约束         | 完全乱序         |
-| 单流            | 多流           |
-| 内核控制          | 应用控制         |
-
----
-
-### 4.3 高 RTT 数学模型（直观）
-
-```
-Throughput ≈ WindowSize × ChunkSize / RTT
-```
-
-HRUFT 可 **人为放大 WindowSize**
-TCP 不能
-
----
-
-## 5. 内存管理设计（mmap）
-
-### 5.1 发送端
-
-* mmap 整个文件
-* Chunk = 指针偏移
-* 无中间缓冲
-
----
-
-### 5.2 接收端
-
-1. `resize_file`
-2. mmap 整个文件
-3. 根据 offset 写入
-
-```cpp
-memcpy(mapped_base + offset, data, len);
-```
-
----
-
-### 5.3 mmap 注意事项
-
-| 平台      | 关键点       |
-| ------- | --------- |
-| Linux   | 可延迟 msync |
-| Windows | 偏移对齐      |
-
----
-
-## 6. 可靠性机制
-
-### 6.1 分层设计
-
-| 层级     | 机制      |
-| ------ | ------- |
-| Packet | CRC32   |
-| Chunk  | SHA-256 |
-| File   | SHA-256 |
-
----
-
-### 6.2 丢包恢复
-
-* Packet 丢失 → bitmap
-* Chunk NACK → 只补丢失包
-* 不整块重传
-
----
-
-## 7. 安全设计
-
-### 7.1 加密模型
-
-```
-Data → AES-CTR → Cipher
-Cipher + Header → HMAC → Tag
-```
-
----
-
-### 7.2 安全属性
-
-| 威胁 | 防护          |
-| -- | ----------- |
-| 篡改 | HMAC        |
-| 伪造 | HMAC        |
-| 重放 | seq + nonce |
-| 窃听 | AES         |
-
----
-
-## 8. 跨平台抽象层
-
-### 8.1 Socket 抽象
-
-```cpp
-class UdpSocket {
-public:
-    bool bind(uint16_t port);
-    ssize_t sendTo(...);
-    ssize_t recvFrom(...);
-};
-```
-
----
-
-### 8.2 平台差异封装
-
-| 项     | Linux | Windows       |
-| ----- | ----- | ------------- |
-| init  | 无     | WSAStartup    |
-| close | close | closesocket   |
-| mmap  | mmap  | MapViewOfFile |
-
----
-
-## 9. 线程模型
-
-### 9.1 发送端
-
-* 1 × Control Thread
-* N × Worker Threads
-
----
-
-### 9.2 接收端
-
-* 1 × Control Thread
-* N × Data Receiver Threads
-* 1 × Integrity Thread
-
----
-
-## 10. 状态机设计
-
-```
-INIT
- ↓
-HANDSHAKE
- ↓
-TRANSFER
- ↓
-VERIFY
- ↓
-DONE
-```
-
----
-
-## 11. 监控与日志
-
-```
-[45.2%] Speed=118MB/s RTT=180ms
-Chunks: 128/512
-Retries: 3
-```
-
----
-
-## 12. 项目目录结构建议
-
+### 项目结构
 ```
 hruft/
- ├─ protocol/
- ├─ net/
- ├─ core/
- ├─ security/
- ├─ platform/
- ├─ cli/
- └─ main.cpp
+├── CMakeLists.txt          # 构建配置文件
+├── src/                    # 源代码目录
+├── include/                # 头文件目录
+├── lib/                    # 第三方库目录
+├── external/               # 外部依赖目录
+└── build/                  # 构建目录
 ```
+
+### 依赖项
+- UDT库（UDP-based Data Transfer）
+- 标准C++17库
+- 跨平台网络库（Winsock2 / BSD sockets）
+
+### 扩展开发
+如需扩展功能，可修改以下部分：
+- 在`protocol/`目录中添加新的协议定义
+- 在`net/`目录中扩展网络功能
+- 在`security/`目录中增强安全功能
+
+## 性能优化建议
+
+1. **调整窗口大小**：根据网络延迟调整传输窗口大小，高延迟网络建议增大窗口
+2. **优化MSS**：根据MTU（最大传输单元）调整MSS，避免IP分片
+3. **并行传输**：对于特大文件，可考虑分块并行传输
+4. **内存管理**：使用内存映射文件（mmap）减少内存拷贝开销
+
+## 故障排除
+
+### 常见问题
+
+1. **连接失败**
+    - 检查防火墙设置
+    - 确认目标端口是否开放
+    - 验证IP地址和端口号
+
+2. **传输速度慢**
+    - 检查网络带宽限制
+    - 调整传输窗口大小
+    - 检查是否有网络丢包
+
+3. **校验失败**
+    - 确保发送和接收的文件路径正确
+    - 检查磁盘空间是否充足
+    - 验证网络传输过程中是否有数据损坏
+
+### 调试信息
+启用详细统计模式可获取更多调试信息：
+```bash
+./hruft send 192.168.1.100 9000 file.iso --detailed
+```
+
+## 许可证
+
+本项目采用MIT许可证。详见LICENSE文件。
+
+## 贡献指南
+
+欢迎提交问题报告和功能请求。提交代码前请确保：
+1. 代码符合项目编码规范
+2. 添加必要的测试用例
+3. 更新相关文档
+
+## 版本历史
+
+- v1.0.0 (初始版本)
+    - 基于UDP的可靠文件传输
+    - 支持跨平台编译和运行
+    - 完整的传输统计功能
+    - 数据完整性校验
+
+## 技术支持
+
+如有技术问题，请：
+1. 查看项目文档
+2. 检查已存在的问题报告
+3. 提交新的Issue
 
 ---
 
-## 13. 结论
-
-> **HRUFT 是一个为“高时延 + 大文件 + 可控性能”而生的 UDP 可靠传输系统。**
-
-它不是 TCP 的替代，而是 **TCP 在极端场景下的工程级超集方案**。
-
+**注意**：本系统专为可控网络环境设计，不适用于需要NAT穿透或公网P2P传输的场景。
