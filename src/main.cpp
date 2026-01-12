@@ -13,10 +13,11 @@
 
 #ifdef _WIN32
 #include <winsock2.h>
-#include <ws2tcpip.h>
+#include <ws2tcpip.h> // inet_pton 定义在这里
 #else
-#include <unistd.h>
 #include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #endif
 
 #include "udt.h"

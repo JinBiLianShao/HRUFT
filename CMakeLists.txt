@@ -72,10 +72,15 @@ if (TARGET_OS STREQUAL "windows")
     # --- Windows 平台配置 ---
     add_definitions(-D_CRT_SECURE_NO_WARNINGS) # 忽略 MSVC 安全警告
     message(STATUS "Build Mode: Windows")
+    add_compile_definitions(UDT_STATIC)
+    add_compile_definitions(UDT_EXPORTS)
+    add_compile_definitions(WIN32 UDT_STATIC _CRT_SECURE_NO_WARNINGS)
+    add_compile_options(-static -static-libgcc -static-libstdc++)
 
     # 如果在 Linux 下使用 MinGW 交叉编译 Windows
     if (CMAKE_HOST_SYSTEM_NAME MATCHES "Linux")
         set(CMAKE_SYSTEM_NAME Windows)
+        add_definitions(-DUDT_STATIC)
         set(CMAKE_C_COMPILER x86_64-w64-mingw32-gcc)
         set(CMAKE_CXX_COMPILER x86_64-w64-mingw32-g++)
     endif()
@@ -166,7 +171,7 @@ target_include_directories(${PROJECT_NAME} PUBLIC ${INCLUDE_DIRS})
 # ---------------------------------------------------------------------------------------
 if (TARGET_TYPE STREQUAL "executable")
     if (TARGET_OS STREQUAL "windows")
-        # Windows 必须链接的库 (网络、基础 API)
+        add_definitions(-D_WIN32_WINNT=0x0600)
         target_link_libraries(${PROJECT_NAME} PRIVATE ws2_32 wsock32 iphlpapi shlwapi)
     else()
         # Linux 基础系统库
