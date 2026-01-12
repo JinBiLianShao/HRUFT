@@ -171,6 +171,8 @@ target_include_directories(${PROJECT_NAME} PUBLIC ${INCLUDE_DIRS})
 # ---------------------------------------------------------------------------------------
 if (TARGET_TYPE STREQUAL "executable")
     if (TARGET_OS STREQUAL "windows")
+        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static-libgcc -static-libstdc++ -static")
+        set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -static-libgcc -static-libstdc++ -static")
         add_definitions(-D_WIN32_WINNT=0x0600)
         target_link_libraries(${PROJECT_NAME} PRIVATE ws2_32 wsock32 iphlpapi shlwapi)
     else()

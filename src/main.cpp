@@ -14,6 +14,7 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h> // inet_pton 定义在这里
+#include <windows.h>
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -567,6 +568,10 @@ void run_receiver(int port, const char *save_path) {
 // ==========================================
 
 int main(int argc, char *argv[]) {
+#ifdef _WIN32
+    // 强制设置控制台输出代码页为 UTF-8 (65001)
+    SetConsoleOutputCP(65001);
+#endif
     // 添加命令行参数解析
     bool detailed_stats = false;
 
