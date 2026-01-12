@@ -10,6 +10,7 @@
 #include <iomanip>
 #include <sstream>
 #include <cmath>
+#include <queue>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -51,17 +52,23 @@ struct TransferStatistics {
     // 基础信息
     long long total_bytes = 0;
     long long transferred_bytes = 0;
+    long long bytes_since_last_report = 0; // 用于累计上次报告以来的字节数
 
     // 时间统计
     std::chrono::steady_clock::time_point start_time;
     std::chrono::steady_clock::time_point end_time;
     std::chrono::steady_clock::time_point last_report_time;
+    std::chrono::steady_clock::time_point last_speed_calc_time;
 
     // 速度统计
     double current_speed_mbps = 0.0;
     double average_speed_mbps = 0.0;
     double max_speed_mbps = 0.0;
     double min_speed_mbps = 0.0;
+
+    // 平滑速度计算的队列（用于避免初始速度异常高）
+    std::queue<double> speed_history;
+    const int SPEED_HISTORY_SIZE = 3; // 保存最近3个速度值用于平滑
 
     // UDT性能统计（通过UDT API获取）
     int64_t pktSentTotal = 0; // 总发送包数
@@ -81,8 +88,8 @@ struct TransferStatistics {
     int pktSndLoss = 0; // 本地发送丢包
     int pktRcvLoss = 0; // 本地接收丢包
     int pktRetrans = 0; // 本地重传
-    double mbpsSendRate = 0.0; // 发送速率
-    double mbpsRecvRate = 0.0; // 接收速率
+    double mbpsSendRate = 0.0; // UDT报告的发送速率（Mbps）
+    double mbpsRecvRate = 0.0; // UDT报告的接收速率（Mbps）
     int64_t usSndDuration = 0; // 本地发送时间
 
     // 连接质量
@@ -90,16 +97,29 @@ struct TransferStatistics {
     double retransmission_rate = 0.0;
     double efficiency_ratio = 0.0; // 传输效率
 
+    // 传输开始时间戳（用于过滤初始速度异常）
+    std::chrono::steady_clock::time_point first_speed_calc_time;
+    bool first_speed_calculated = false;
+
     // 初始化统计
     void init(long long total_size) {
         total_bytes = total_size;
         transferred_bytes = 0;
+        bytes_since_last_report = 0;
         start_time = std::chrono::steady_clock::now();
         last_report_time = start_time;
+        last_speed_calc_time = start_time;
+        first_speed_calc_time = start_time;
+        first_speed_calculated = false;
         max_speed_mbps = 0.0;
         min_speed_mbps = std::numeric_limits<double>::max();
         current_speed_mbps = 0.0;
         average_speed_mbps = 0.0;
+
+        // 清空速度历史
+        while (!speed_history.empty()) {
+            speed_history.pop();
+        }
 
         // 重置所有统计
         pktSentTotal = 0;
@@ -127,31 +147,68 @@ struct TransferStatistics {
         efficiency_ratio = 0.0;
     }
 
-    // 更新速度统计
+    // 更新速度统计 - 修复版本（避免初始速度异常）
     void update_speed(long long bytes_transferred) {
         auto now = std::chrono::steady_clock::now();
-        auto time_diff = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_report_time).count();
+        bytes_since_last_report += bytes_transferred;
+        transferred_bytes += bytes_transferred;
 
-        if (time_diff >= 100) {
-            // 至少100ms计算一次
-            double current_speed = (bytes_transferred * 8.0 / 1024.0 / 1024.0) / (time_diff / 1000.0);
-            current_speed_mbps = current_speed;
+        // 忽略前100ms的速度计算，避免初始速度异常高
+        auto time_since_start = std::chrono::duration_cast<std::chrono::milliseconds>(now - first_speed_calc_time).count();
+        if (!first_speed_calculated && time_since_start < 100) {
+            return; // 跳过前100ms的速度计算
+        }
+        first_speed_calculated = true;
 
-            // 更新最大/最小速度
-            if (current_speed > max_speed_mbps) max_speed_mbps = current_speed;
-            if (current_speed < min_speed_mbps && current_speed > 0) min_speed_mbps = current_speed;
+        // 至少500ms计算一次瞬时速度
+        auto time_diff = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_speed_calc_time).count();
 
-            last_report_time = now;
+        if (time_diff >= 500) {
+            // 计算瞬时速度：字节数 × 8 / 时间(秒) / 1024 / 1024
+            if (time_diff > 0) {
+                double raw_speed = (bytes_since_last_report * 8.0) / (time_diff / 1000.0) / (1024.0 * 1024.0);
+
+                // 使用滑动平均平滑速度
+                speed_history.push(raw_speed);
+                if (speed_history.size() > SPEED_HISTORY_SIZE) {
+                    speed_history.pop();
+                }
+
+                // 计算平均速度
+                double sum = 0.0;
+                int count = 0;
+                std::queue<double> temp = speed_history;
+                while (!temp.empty()) {
+                    sum += temp.front();
+                    temp.pop();
+                    count++;
+                }
+
+                if (count > 0) {
+                    current_speed_mbps = sum / count;
+
+                    // 更新最大/最小速度（忽略初始异常值）
+                    if (current_speed_mbps > max_speed_mbps && current_speed_mbps < 10000) { // 限制最大速度阈值
+                        max_speed_mbps = current_speed_mbps;
+                    }
+                    if (current_speed_mbps > 0 && current_speed_mbps < min_speed_mbps) {
+                        min_speed_mbps = current_speed_mbps;
+                    }
+                }
+            }
+
+            bytes_since_last_report = 0;
+            last_speed_calc_time = now;
         }
 
         // 计算平均速度
         auto total_time = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time).count();
         if (total_time > 0) {
-            average_speed_mbps = (transferred_bytes * 8.0 / 1024.0 / 1024.0) / (total_time / 1000.0);
+            average_speed_mbps = (transferred_bytes * 8.0) / (total_time / 1000.0) / (1024.0 * 1024.0);
         }
     }
 
-    // 获取UDT性能统计 - 基于正确的CPerfMon结构体
+    // 获取UDT性能统计 - 修复版本
     void collect_udt_stats(UDTSOCKET sock) {
         UDT::TRACEINFO perf;
         if (UDT::ERROR != UDT::perfmon(sock, &perf)) {
@@ -173,24 +230,30 @@ struct TransferStatistics {
             pktSndLoss = perf.pktSndLoss;
             pktRcvLoss = perf.pktRcvLoss;
             pktRetrans = perf.pktRetrans;
+
+            // 使用UDT报告的速率
             mbpsSendRate = perf.mbpsSendRate;
             mbpsRecvRate = perf.mbpsRecvRate;
+
             usSndDuration = perf.usSndDuration;
 
-            // 计算丢包率
-            long long total_packets = perf.pktSentTotal + perf.pktRecvTotal;
-            if (total_packets > 0) {
-                loss_rate = ((perf.pktSndLossTotal + perf.pktRcvLossTotal) * 100.0) / total_packets;
+            // 修复丢包率计算
+            if (pktSentTotal > 0) {
+                loss_rate = (pktSndLossTotal * 100.0) / pktSentTotal;
+            } else if (pktRecvTotal > 0) {
+                loss_rate = (pktRcvLossTotal * 100.0) / pktRecvTotal;
+            } else {
+                loss_rate = 0.0;
             }
 
             // 计算重传率
-            if (perf.pktSentTotal > 0) {
-                retransmission_rate = (perf.pktRetransTotal * 100.0) / perf.pktSentTotal;
+            if (pktSentTotal > 0) {
+                retransmission_rate = (pktRetransTotal * 100.0) / pktSentTotal;
             }
 
             // 计算传输效率：有效包数 / 总发送包数
-            if (perf.pktSentTotal > 0) {
-                efficiency_ratio = ((perf.pktSentTotal - perf.pktRetransTotal) * 100.0) / perf.pktSentTotal;
+            if (pktSentTotal > 0) {
+                efficiency_ratio = ((pktSentTotal - pktRetransTotal) * 100.0) / pktSentTotal;
             }
         }
     }
@@ -210,8 +273,7 @@ struct TransferStatistics {
         ss << "\"total_time_seconds\":" << total_seconds << ",";
         ss << "\"average_speed_mbps\":" << average_speed_mbps << ",";
         ss << "\"max_speed_mbps\":" << max_speed_mbps << ",";
-        ss << "\"min_speed_mbps\":" << (min_speed_mbps < std::numeric_limits<double>::max() ? min_speed_mbps : 0) <<
-                ",";
+        ss << "\"min_speed_mbps\":" << (min_speed_mbps < std::numeric_limits<double>::max() ? min_speed_mbps : 0) << ",";
         ss << "\"current_speed_mbps\":" << current_speed_mbps << ",";
 
         // 时间分析
@@ -279,8 +341,7 @@ struct TransferStatistics {
         ss << "  传输时间: " << total_seconds << " 秒" << std::endl;
         ss << "  平均速度: " << average_speed_mbps << " Mbps" << std::endl;
         ss << "  最高速度: " << max_speed_mbps << " Mbps" << std::endl;
-        ss << "  最低速度: " << (min_speed_mbps < std::numeric_limits<double>::max() ? min_speed_mbps : 0) << " Mbps" <<
-                std::endl;
+        ss << "  最低速度: " << (min_speed_mbps < std::numeric_limits<double>::max() ? min_speed_mbps : 0) << " Mbps" << std::endl;
         ss << std::endl;
         ss << "  包统计:" << std::endl;
         ss << "    总发送包数: " << pktSentTotal << std::endl;
@@ -293,8 +354,8 @@ struct TransferStatistics {
         ss << "    传输效率: " << efficiency_ratio << "%" << std::endl;
         ss << std::endl;
         ss << "  即时性能:" << std::endl;
-        ss << "    当前发送速率: " << mbpsSendRate << " Mbps" << std::endl;
-        ss << "    当前接收速率: " << mbpsRecvRate << " Mbps" << std::endl;
+        ss << "    UDT发送速率: " << mbpsSendRate << " Mbps" << std::endl;
+        ss << "    UDT接收速率: " << mbpsRecvRate << " Mbps" << std::endl;
 
         return ss.str();
     }
@@ -310,7 +371,7 @@ void report_json(const std::string &type, const std::string &key, const std::str
 
 void report_progress(long long current, long long total, double speed_mbps,
                      const TransferStatistics &stats, bool detailed = false) {
-    int percent = (total > 0) ? (int) ((current * 100) / total) : 0;
+    int percent = (total > 0) ? (int)((current * 100) / total) : 0;
     std::cout << std::fixed << std::setprecision(2);
 
     if (detailed) {
@@ -318,18 +379,18 @@ void report_progress(long long current, long long total, double speed_mbps,
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - stats.start_time).count();
 
         std::cout << "{\"type\":\"progress\", \"percent\":" << percent
-                << ", \"current\":" << current
-                << ", \"total\":" << total
-                << ", \"speed_mbps\":" << speed_mbps
-                << ", \"elapsed_seconds\":" << elapsed
-                << ", \"average_speed_mbps\":" << stats.average_speed_mbps
-                << ", \"remaining_bytes\":" << (total - current)
-                << "}" << std::endl;
+                  << ", \"current\":" << current
+                  << ", \"total\":" << total
+                  << ", \"speed_mbps\":" << speed_mbps
+                  << ", \"elapsed_seconds\":" << elapsed
+                  << ", \"average_speed_mbps\":" << stats.average_speed_mbps
+                  << ", \"remaining_bytes\":" << (total - current)
+                  << "}" << std::endl;
     } else {
         std::cout << "{\"type\":\"progress\", \"percent\":" << percent
-                << ", \"current\":" << current
-                << ", \"total\":" << total
-                << ", \"speed_mbps\":" << speed_mbps << "}" << std::endl;
+                  << ", \"current\":" << current
+                  << ", \"total\":" << total
+                  << ", \"speed_mbps\":" << speed_mbps << "}" << std::endl;
     }
 }
 
@@ -343,11 +404,11 @@ std::string calculate_file_md5(const std::string &filepath) {
     std::vector<char> buffer(buffer_size);
     while (file.good()) {
         file.read(buffer.data(), buffer_size);
-        if (file.gcount() > 0) md5_append(&state, (const md5_byte_t *) buffer.data(), (int) file.gcount());
+        if (file.gcount() > 0) md5_append(&state, (const md5_byte_t*)buffer.data(), (int)file.gcount());
     }
     md5_finish(&state, digest);
     std::stringstream ss;
-    for (int i = 0; i < 16; ++i) ss << std::hex << std::setw(2) << std::setfill('0') << (int) digest[i];
+    for (int i = 0; i < 16; ++i) ss << std::hex << std::setw(2) << std::setfill('0') << (int)digest[i];
     return ss.str();
 }
 
@@ -367,7 +428,7 @@ void apply_socket_opts(UDTSOCKET sock, int mss, int win_size) {
 // 发送端逻辑
 // ==========================================
 
-void run_sender(const char *ip, int port, const char *filepath, const UDTConfig &config) {
+void run_sender(const char* ip, int port, const char* filepath, const UDTConfig& config) {
     report_json("status", "message", "Calculating MD5...");
     std::string local_md5 = calculate_file_md5(filepath);
     if (local_md5.empty()) {
@@ -385,7 +446,7 @@ void run_sender(const char *ip, int port, const char *filepath, const UDTConfig 
     inet_pton(AF_INET, ip, &serv_addr.sin_addr);
 
     report_json("status", "message", "Connecting...");
-    if (UDT::ERROR == UDT::connect(client, (sockaddr *) &serv_addr, sizeof(serv_addr))) {
+    if (UDT::ERROR == UDT::connect(client, (sockaddr*)&serv_addr, sizeof(serv_addr))) {
         report_json("error", "message", UDT::getlasterror().getErrorMessage());
         return;
     }
@@ -405,7 +466,7 @@ void run_sender(const char *ip, int port, const char *filepath, const UDTConfig 
     hp.window_size = config.window_size;
     memcpy(hp.md5, local_md5.c_str(), 32);
 
-    UDT::send(client, (char *) &hp, sizeof(HandshakePacket), 0);
+    UDT::send(client, (char*)&hp, sizeof(HandshakePacket), 0);
     stats.transferred_bytes += sizeof(HandshakePacket);
 
     // 2. 开始传输数据
@@ -419,7 +480,7 @@ void run_sender(const char *ip, int port, const char *filepath, const UDTConfig 
 
     while (total_sent < f_size) {
         ifs.read(buffer.data(), buffer.size());
-        int read_len = (int) ifs.gcount();
+        int read_len = (int)ifs.gcount();
         if (read_len <= 0) break;
 
         int offset = 0;
@@ -428,17 +489,16 @@ void run_sender(const char *ip, int port, const char *filepath, const UDTConfig 
             if (sent <= 0) break;
             offset += sent;
             total_sent += sent;
-            stats.transferred_bytes = total_sent;
 
-            // 更新速度统计
+            // 更新速度统计（累积字节数）
             stats.update_speed(sent);
         }
 
         auto now = std::chrono::steady_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_time).count();
         if (duration >= 500) {
-            double speed = ((total_sent - last_bytes) / 1024.0 / 1024.0) / (duration / 1000.0);
-            report_progress(total_sent, f_size, speed, stats, true);
+            // 使用stats中的当前速度，而不是重新计算
+            report_progress(total_sent, f_size, stats.current_speed_mbps, stats, true);
             last_time = now;
             last_bytes = total_sent;
 
@@ -473,7 +533,7 @@ void run_sender(const char *ip, int port, const char *filepath, const UDTConfig 
 // 接收端逻辑
 // ==========================================
 
-void run_receiver(int port, const char *save_path) {
+void run_receiver(int port, const char* save_path) {
     UDTSOCKET serv = UDT::socket(AF_INET, SOCK_STREAM, 0);
 
     sockaddr_in my_addr;
@@ -481,21 +541,21 @@ void run_receiver(int port, const char *save_path) {
     my_addr.sin_port = htons(port);
     my_addr.sin_addr.s_addr = INADDR_ANY;
 
-    UDT::bind(serv, (sockaddr *) &my_addr, sizeof(my_addr));
+    UDT::bind(serv, (sockaddr*)&my_addr, sizeof(my_addr));
     UDT::listen(serv, 5);
     report_json("status", "message", "Waiting for sender...");
 
     sockaddr_in client_addr;
     int namelen = sizeof(client_addr);
-    UDTSOCKET recver = UDT::accept(serv, (sockaddr *) &client_addr, &namelen);
+    UDTSOCKET recver = UDT::accept(serv, (sockaddr*)&client_addr, &namelen);
 
     // 1. 接收协商包
     HandshakePacket hp;
-    UDT::recv(recver, (char *) &hp, sizeof(HandshakePacket), 0);
+    UDT::recv(recver, (char*)&hp, sizeof(HandshakePacket), 0);
 
     // 2. 关键：根据发送端的建议动态调整接收端 Socket
     report_json("status", "message",
-                "Syncing config: MSS=" + std::to_string(hp.mss) + ", WIN=" + std::to_string(hp.window_size));
+        "Syncing config: MSS=" + std::to_string(hp.mss) + ", WIN=" + std::to_string(hp.window_size));
     apply_socket_opts(recver, hp.mss, hp.window_size);
 
     // 3. 初始化传输统计
@@ -511,20 +571,19 @@ void run_receiver(int port, const char *save_path) {
     long long last_bytes = 0;
 
     while (total_recv < hp.file_size) {
-        int rs = UDT::recv(recver, buffer.data(), (int) buffer.size(), 0);
+        int rs = UDT::recv(recver, buffer.data(), (int)buffer.size(), 0);
         if (rs <= 0) break;
         ofs.write(buffer.data(), rs);
         total_recv += rs;
-        stats.transferred_bytes = total_recv;
 
-        // 更新速度统计
+        // 更新速度统计（累积字节数）
         stats.update_speed(rs);
 
         auto now = std::chrono::steady_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_time).count();
         if (duration >= 500) {
-            double speed = ((total_recv - last_bytes) / 1024.0 / 1024.0) / (duration / 1000.0);
-            report_progress(total_recv, hp.file_size, speed, stats, true);
+            // 使用stats中的当前速度，而不是重新计算
+            report_progress(total_recv, hp.file_size, stats.current_speed_mbps, stats, true);
             last_time = now;
             last_bytes = total_recv;
 
@@ -557,7 +616,7 @@ void run_receiver(int port, const char *save_path) {
     bool success = (actual_md5 == expected_md5);
 
     std::cout << "{\"type\":\"verify\", \"success\":" << (success ? "true" : "false")
-            << ", \"expected\":\"" << expected_md5 << "\", \"actual\":\"" << actual_md5 << "\"}" << std::endl;
+              << ", \"expected\":\"" << expected_md5 << "\", \"actual\":\"" << actual_md5 << "\"}" << std::endl;
 
     UDT::close(recver);
     UDT::close(serv);
@@ -567,7 +626,7 @@ void run_receiver(int port, const char *save_path) {
 // 主函数
 // ==========================================
 
-int main(int argc, char *argv[]) {
+int main(int argc, char* argv[]) {
 #ifdef _WIN32
     // 强制设置控制台输出代码页为 UTF-8 (65001)
     SetConsoleOutputCP(65001);
@@ -588,16 +647,18 @@ int main(int argc, char *argv[]) {
             else if (std::string(argv[i]) == "--detailed") detailed_stats = true;
         }
         run_sender(argv[2], std::atoi(argv[3]), argv[4], config);
-    } else if (mode == "recv" && argc >= 4) {
+    }
+    else if (mode == "recv" && argc >= 4) {
         // 接收端现在不需要在命令行指定 mss 和 window 了
         for (int i = 4; i < argc; ++i) {
             if (std::string(argv[i]) == "--detailed") detailed_stats = true;
         }
         run_receiver(std::atoi(argv[2]), argv[3]);
-    } else {
+    }
+    else {
         std::cerr << "Usage:" << std::endl;
         std::cerr << "  Send: " << argv[0] <<
-                " send <ip> <port> <filepath> [--mss 1500] [--window 1048576] [--detailed]" << std::endl;
+            " send <ip> <port> <filepath> [--mss 1500] [--window 1048576] [--detailed]" << std::endl;
         std::cerr << "  Receive: " << argv[0] << " recv <port> <savepath> [--detailed]" << std::endl;
         std::cerr << std::endl;
         std::cerr << "Enhanced Statistics Features:" << std::endl;
