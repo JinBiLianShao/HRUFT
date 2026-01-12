@@ -49,10 +49,14 @@ struct UDTConfig {
 // ==========================================
 
 struct TransferStatistics {
+    // 角色标识
+    bool is_sender = false;
+
     // 基础信息
     long long total_bytes = 0;
     long long transferred_bytes = 0;
-    long long bytes_since_last_report = 0; // 用于累计上次报告以来的字节数
+    long long bytes_since_last_report = 0;
+    long long initial_bytes_to_ignore = 0;
 
     // 时间统计
     std::chrono::steady_clock::time_point start_time;
@@ -66,46 +70,54 @@ struct TransferStatistics {
     double max_speed_mbps = 0.0;
     double min_speed_mbps = 0.0;
 
-    // 平滑速度计算的队列（用于避免初始速度异常高）
+    // 平滑速度计算的队列
     std::queue<double> speed_history;
-    const int SPEED_HISTORY_SIZE = 3; // 保存最近3个速度值用于平滑
+    const int SPEED_HISTORY_SIZE = 3;
 
     // UDT性能统计（通过UDT API获取）
-    int64_t pktSentTotal = 0; // 总发送包数
-    int64_t pktRecvTotal = 0; // 总接收包数
-    int pktSndLossTotal = 0; // 发送端丢包数
-    int pktRcvLossTotal = 0; // 接收端丢包数
-    int pktRetransTotal = 0; // 重传包数
-    int pktSentACKTotal = 0; // 发送ACK数
-    int pktRecvACKTotal = 0; // 接收ACK数
-    int pktSentNAKTotal = 0; // 发送NAK数
-    int pktRecvNAKTotal = 0; // 接收NAK数
-    int64_t usSndDurationTotal = 0; // 总发送时间（微秒）
+    // 全局测量值
+    int64_t pktSentTotal = 0;         // 总发送数据包数
+    int64_t pktRecvTotal = 0;         // 总接收数据包数
+    int pktSndLossTotal = 0;          // 发送端丢失的数据包数
+    int pktRcvLossTotal = 0;          // 接收端丢失的数据包数
+    int pktRetransTotal = 0;          // 重传的数据包数
+    int pktSentACKTotal = 0;          // 发送的ACK包数
+    int pktRecvACKTotal = 0;          // 接收的ACK包数
+    int pktSentNAKTotal = 0;          // 发送的NAK包数
+    int pktRecvNAKTotal = 0;          // 接收的NAK包数
+    int64_t usSndDurationTotal = 0;   // 总发送时间（微秒）
+
+    // 新增：估计的数据包数（基于文件大小和MSS）
+    int64_t estimated_data_packets = 0;
+    int64_t actual_data_bytes_received = 0;
 
     // 即时性能统计
-    int64_t pktSent = 0; // 本地发送包数
-    int64_t pktRecv = 0; // 本地接收包数
-    int pktSndLoss = 0; // 本地发送丢包
-    int pktRcvLoss = 0; // 本地接收丢包
-    int pktRetrans = 0; // 本地重传
-    double mbpsSendRate = 0.0; // UDT报告的发送速率（Mbps）
-    double mbpsRecvRate = 0.0; // UDT报告的接收速率（Mbps）
-    int64_t usSndDuration = 0; // 本地发送时间
+    int64_t pktSent = 0;              // 本地发送包数
+    int64_t pktRecv = 0;              // 本地接收包数
+    int pktSndLoss = 0;               // 本地发送丢包
+    int pktRcvLoss = 0;               // 本地接收丢包
+    int pktRetrans = 0;               // 本地重传
+    double mbpsSendRate = 0.0;        // UDT报告的发送速率（Mbps）
+    double mbpsRecvRate = 0.0;        // UDT报告的接收速率（Mbps）
+    int64_t usSndDuration = 0;        // 本地发送时间
 
-    // 连接质量
-    double loss_rate = 0.0;
-    double retransmission_rate = 0.0;
-    double efficiency_ratio = 0.0; // 传输效率
+    // 计算出的统计
+    double data_packet_loss_rate = 0.0;      // 数据包丢包率
+    double control_overhead_ratio = 0.0;     // 控制包开销比例
+    double network_efficiency = 0.0;         // 网络传输效率
+    double data_integrity_score = 0.0;       // 数据完整性评分
 
-    // 传输开始时间戳（用于过滤初始速度异常）
+    // 传输开始时间戳
     std::chrono::steady_clock::time_point first_speed_calc_time;
     bool first_speed_calculated = false;
 
     // 初始化统计
-    void init(long long total_size) {
+    void init(long long total_size, bool sender = false) {
+        is_sender = sender;
         total_bytes = total_size;
         transferred_bytes = 0;
         bytes_since_last_report = 0;
+        initial_bytes_to_ignore = 0;
         start_time = std::chrono::steady_clock::now();
         last_report_time = start_time;
         last_speed_calc_time = start_time;
@@ -133,6 +145,9 @@ struct TransferStatistics {
         pktRecvNAKTotal = 0;
         usSndDurationTotal = 0;
 
+        estimated_data_packets = 0;
+        actual_data_bytes_received = 0;
+
         pktSent = 0;
         pktRecv = 0;
         pktSndLoss = 0;
@@ -142,23 +157,30 @@ struct TransferStatistics {
         mbpsRecvRate = 0.0;
         usSndDuration = 0;
 
-        loss_rate = 0.0;
-        retransmission_rate = 0.0;
-        efficiency_ratio = 0.0;
+        data_packet_loss_rate = 0.0;
+        control_overhead_ratio = 0.0;
+        network_efficiency = 0.0;
+        data_integrity_score = 0.0;
     }
 
-    // 更新速度统计 - 修复版本（避免初始速度异常）
+    // 更新速度统计
     void update_speed(long long bytes_transferred) {
         auto now = std::chrono::steady_clock::now();
         bytes_since_last_report += bytes_transferred;
         transferred_bytes += bytes_transferred;
 
-        // 忽略前100ms的速度计算，避免初始速度异常高
+        // 忽略前200ms的数据，避免初始速度计算异常
         auto time_since_start = std::chrono::duration_cast<std::chrono::milliseconds>(now - first_speed_calc_time).count();
-        if (!first_speed_calculated && time_since_start < 100) {
-            return; // 跳过前100ms的速度计算
+        if (!first_speed_calculated) {
+            if (time_since_start < 200) {
+                initial_bytes_to_ignore += bytes_transferred;
+                return;
+            } else {
+                first_speed_calculated = true;
+                // 重置bytes_since_last_report，减去已经忽略的字节
+                bytes_since_last_report = 0;
+            }
         }
-        first_speed_calculated = true;
 
         // 至少500ms计算一次瞬时速度
         auto time_diff = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_speed_calc_time).count();
@@ -188,7 +210,7 @@ struct TransferStatistics {
                     current_speed_mbps = sum / count;
 
                     // 更新最大/最小速度（忽略初始异常值）
-                    if (current_speed_mbps > max_speed_mbps && current_speed_mbps < 10000) { // 限制最大速度阈值
+                    if (current_speed_mbps > max_speed_mbps && current_speed_mbps < 10000) {
                         max_speed_mbps = current_speed_mbps;
                     }
                     if (current_speed_mbps > 0 && current_speed_mbps < min_speed_mbps) {
@@ -204,11 +226,22 @@ struct TransferStatistics {
         // 计算平均速度
         auto total_time = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time).count();
         if (total_time > 0) {
-            average_speed_mbps = (transferred_bytes * 8.0) / (total_time / 1000.0) / (1024.0 * 1024.0);
+            // 从总传输字节中减去初始忽略的字节
+            long long effective_bytes = transferred_bytes - initial_bytes_to_ignore;
+            if (effective_bytes < 0) effective_bytes = 0;
+            average_speed_mbps = (effective_bytes * 8.0) / (total_time / 1000.0) / (1024.0 * 1024.0);
         }
     }
 
-    // 获取UDT性能统计 - 修复版本
+    // 设置MSS用于估计数据包数
+    void set_mss_for_estimation(int mss) {
+        if (total_bytes > 0 && mss > 0) {
+            // 估计数据包数：文件大小 / MSS
+            estimated_data_packets = (total_bytes + mss - 1) / mss; // 向上取整
+        }
+    }
+
+    // 获取UDT性能统计并计算相关指标
     void collect_udt_stats(UDTSOCKET sock) {
         UDT::TRACEINFO perf;
         if (UDT::ERROR != UDT::perfmon(sock, &perf)) {
@@ -231,29 +264,72 @@ struct TransferStatistics {
             pktRcvLoss = perf.pktRcvLoss;
             pktRetrans = perf.pktRetrans;
 
-            // 使用UDT报告的速率
+            // UDT报告的速率
             mbpsSendRate = perf.mbpsSendRate;
             mbpsRecvRate = perf.mbpsRecvRate;
 
             usSndDuration = perf.usSndDuration;
 
-            // 修复丢包率计算
-            if (pktSentTotal > 0) {
-                loss_rate = (pktSndLossTotal * 100.0) / pktSentTotal;
-            } else if (pktRecvTotal > 0) {
-                loss_rate = (pktRcvLossTotal * 100.0) / pktRecvTotal;
-            } else {
-                loss_rate = 0.0;
-            }
+            // 计算各项统计指标
+            calculate_derived_stats();
+        }
+    }
 
-            // 计算重传率
+    // 计算派生统计指标
+    void calculate_derived_stats() {
+        if (is_sender) {
+            // 发送端统计
             if (pktSentTotal > 0) {
-                retransmission_rate = (pktRetransTotal * 100.0) / pktSentTotal;
-            }
+                // 数据包丢包率：丢失的数据包 / 发送的数据包
+                data_packet_loss_rate = (pktSndLossTotal * 100.0) / pktSentTotal;
 
-            // 计算传输效率：有效包数 / 总发送包数
-            if (pktSentTotal > 0) {
-                efficiency_ratio = ((pktSentTotal - pktRetransTotal) * 100.0) / pktSentTotal;
+                // 控制包开销：接收的ACK+NAK包 / 发送的数据包
+                int64_t control_packets_received = pktRecvACKTotal + pktRecvNAKTotal;
+                if (pktSentTotal > 0) {
+                    control_overhead_ratio = (control_packets_received * 100.0) / pktSentTotal;
+                }
+
+                // 网络传输效率：(发送的有效数据包 - 重传包) / 发送的总数据包
+                if (pktSentTotal > 0) {
+                    network_efficiency = ((pktSentTotal - pktRetransTotal) * 100.0) / pktSentTotal;
+                }
+
+                // 数据完整性评分（基于丢包率和重传率）
+                data_integrity_score = 100.0 - (data_packet_loss_rate + (pktRetransTotal * 100.0 / pktSentTotal) / 2);
+                if (data_integrity_score < 0) data_integrity_score = 0;
+                if (data_integrity_score > 100) data_integrity_score = 100;
+            }
+        } else {
+            // 接收端统计
+            // 首先，我们需要估计接收到的数据包数（排除控制包）
+            // UDT的pktRecvTotal包括了所有接收到的包（数据包+控制包）
+
+            // 估计的数据包数（基于文件大小和MSS）
+            if (estimated_data_packets > 0) {
+                // 估计接收到的数据包数（排除控制包开销）
+                int64_t estimated_control_packets = pktSentACKTotal + pktSentNAKTotal;
+                int64_t estimated_data_packets_received = pktRecvTotal - estimated_control_packets;
+                if (estimated_data_packets_received < 0) estimated_data_packets_received = 0;
+
+                // 数据包丢包率
+                if (estimated_data_packets > 0) {
+                    data_packet_loss_rate = (pktRcvLossTotal * 100.0) / estimated_data_packets;
+                }
+
+                // 控制包开销：发送的ACK+NAK包 / 估计的数据包数
+                if (estimated_data_packets > 0) {
+                    control_overhead_ratio = ((pktSentACKTotal + pktSentNAKTotal) * 100.0) / estimated_data_packets;
+                }
+
+                // 网络传输效率：基于实际接收的数据完整性
+                if (estimated_data_packets > 0) {
+                    network_efficiency = ((estimated_data_packets - pktRcvLossTotal) * 100.0) / estimated_data_packets;
+                }
+
+                // 数据完整性评分
+                data_integrity_score = 100.0 - data_packet_loss_rate;
+                if (data_integrity_score < 0) data_integrity_score = 0;
+                if (data_integrity_score > 100) data_integrity_score = 100;
             }
         }
     }
@@ -267,6 +343,7 @@ struct TransferStatistics {
         ss << std::fixed << std::setprecision(2);
         ss << "{";
         ss << "\"type\":\"statistics\",";
+        ss << "\"role\":\"" << (is_sender ? "sender" : "receiver") << "\",";
         ss << "\"total_bytes\":" << total_bytes << ",";
         ss << "\"transferred_bytes\":" << transferred_bytes << ",";
         ss << "\"completion_percentage\":" << (total_bytes > 0 ? (transferred_bytes * 100.0 / total_bytes) : 0) << ",";
@@ -287,43 +364,65 @@ struct TransferStatistics {
             ss << "\"estimated_total_seconds\":" << total_seconds << ",";
         }
 
-        // 包统计
-        ss << "\"packet_stats\":{";
-        ss << "\"pktSentTotal\":" << pktSentTotal << ",";
-        ss << "\"pktRecvTotal\":" << pktRecvTotal << ",";
-        ss << "\"pktSndLossTotal\":" << pktSndLossTotal << ",";
-        ss << "\"pktRcvLossTotal\":" << pktRcvLossTotal << ",";
-        ss << "\"pktRetransTotal\":" << pktRetransTotal << ",";
-        ss << "\"loss_rate\":" << loss_rate << ",";
-        ss << "\"retransmission_rate\":" << retransmission_rate << ",";
-        ss << "\"efficiency_ratio\":" << efficiency_ratio;
+        // UDT原始包统计（包含所有包）
+        ss << "\"udt_raw_packet_stats\":{";
+        ss << "\"total_sent_packets\":" << pktSentTotal << ",";
+        ss << "\"total_received_packets\":" << pktRecvTotal << ",";
+        ss << "\"data_packets_lost_at_sender\":" << pktSndLossTotal << ",";
+        ss << "\"data_packets_lost_at_receiver\":" << pktRcvLossTotal << ",";
+        ss << "\"retransmitted_packets\":" << pktRetransTotal << ",";
+        ss << "\"ack_packets_sent\":" << pktSentACKTotal << ",";
+        ss << "\"ack_packets_received\":" << pktRecvACKTotal << ",";
+        ss << "\"nak_packets_sent\":" << pktSentNAKTotal << ",";
+        ss << "\"nak_packets_received\":" << pktRecvNAKTotal << ",";
+        ss << "\"estimated_data_packets\":" << estimated_data_packets;
+        ss << "},";
+
+        // 计算出的统计指标（基于分析）
+        ss << "\"network_analysis\":{";
+        ss << "\"data_packet_loss_rate\":" << data_packet_loss_rate << ",";
+        ss << "\"control_packet_overhead_ratio\":" << control_overhead_ratio << ",";
+        ss << "\"network_transmission_efficiency\":" << network_efficiency << ",";
+        ss << "\"data_integrity_score\":" << data_integrity_score;
         ss << "},";
 
         // 即时性能
-        ss << "\"instant_stats\":{";
-        ss << "\"pktSent\":" << pktSent << ",";
-        ss << "\"pktRecv\":" << pktRecv << ",";
-        ss << "\"mbpsSendRate\":" << mbpsSendRate << ",";
-        ss << "\"mbpsRecvRate\":" << mbpsRecvRate;
+        ss << "\"instant_performance\":{";
+        ss << "\"packets_sent_last_period\":" << pktSent << ",";
+        ss << "\"packets_received_last_period\":" << pktRecv << ",";
+        ss << "\"udt_send_rate_mbps\":" << mbpsSendRate << ",";
+        ss << "\"udt_receive_rate_mbps\":" << mbpsRecvRate;
         ss << "},";
 
-        // 传输效率评估
-        std::string efficiency_level = "good";
-        if (loss_rate > 10) efficiency_level = "poor";
-        else if (loss_rate > 5) efficiency_level = "fair";
-        else if (loss_rate > 2) efficiency_level = "good";
-        else efficiency_level = "excellent";
+        // 网络质量评估
+        std::string network_quality = "excellent";
+        std::string recommendations = "";
 
-        ss << "\"efficiency_level\":\"" << efficiency_level << "\",";
+        if (data_packet_loss_rate > 10) {
+            network_quality = "poor";
+            recommendations = "High data loss (>10%). Consider reducing window size, increasing MSS, or checking network stability.";
+        } else if (data_packet_loss_rate > 5) {
+            network_quality = "fair";
+            recommendations = "Moderate data loss (5-10%). Network may be congested. Consider adjusting UDT parameters.";
+        } else if (data_packet_loss_rate > 2) {
+            network_quality = "good";
+            recommendations = "Low data loss (2-5%). Network conditions are acceptable.";
+        } else {
+            network_quality = "excellent";
+            recommendations = "Minimal data loss (<2%). Network conditions are excellent.";
+        }
 
-        // 建议（基于统计）
-        std::string suggestions = "";
-        if (loss_rate > 10) suggestions = "High packet loss. Consider reducing window size or increasing MSS.";
-        else if (loss_rate > 5) suggestions = "Moderate packet loss. Network may be congested.";
-        else if (retransmission_rate > 10) suggestions = "High retransmission rate. Check network stability.";
-        else suggestions = "Network conditions are good.";
+        if (control_overhead_ratio > 50) {
+            network_quality = (network_quality == "excellent" ? "good" : network_quality);
+            recommendations += " High control overhead. Consider adjusting UDT flow control parameters.";
+        }
 
-        ss << "\"suggestions\":\"" << suggestions << "\"";
+        ss << "\"network_quality_assessment\":{";
+        ss << "\"quality_level\":\"" << network_quality << "\",";
+        ss << "\"recommendations\":\"" << recommendations << "\",";
+        ss << "\"data_transfer_successful\":true";
+        ss << "}";
+
         ss << "}";
 
         return ss.str();
@@ -336,26 +435,41 @@ struct TransferStatistics {
 
         std::stringstream ss;
         ss << std::fixed << std::setprecision(2);
-        ss << "传输完成！详细统计信息：" << std::endl;
+        ss << "传输完成！" << (is_sender ? "发送端" : "接收端") << "详细统计：" << std::endl;
         ss << "  文件大小: " << (total_bytes / 1024.0 / 1024.0) << " MB" << std::endl;
         ss << "  传输时间: " << total_seconds << " 秒" << std::endl;
         ss << "  平均速度: " << average_speed_mbps << " Mbps" << std::endl;
         ss << "  最高速度: " << max_speed_mbps << " Mbps" << std::endl;
         ss << "  最低速度: " << (min_speed_mbps < std::numeric_limits<double>::max() ? min_speed_mbps : 0) << " Mbps" << std::endl;
         ss << std::endl;
-        ss << "  包统计:" << std::endl;
-        ss << "    总发送包数: " << pktSentTotal << std::endl;
-        ss << "    总接收包数: " << pktRecvTotal << std::endl;
-        ss << "    发送端丢包: " << pktSndLossTotal << std::endl;
-        ss << "    接收端丢包: " << pktRcvLossTotal << std::endl;
-        ss << "    重传包数: " << pktRetransTotal << std::endl;
-        ss << "    丢包率: " << loss_rate << "%" << std::endl;
-        ss << "    重传率: " << retransmission_rate << "%" << std::endl;
-        ss << "    传输效率: " << efficiency_ratio << "%" << std::endl;
+
+        ss << "  UDT原始包统计（包含所有包类型）:" << std::endl;
+        ss << "    总发送包数: " << pktSentTotal << " (数据包+控制包)" << std::endl;
+        ss << "    总接收包数: " << pktRecvTotal << " (数据包+控制包)" << std::endl;
+        ss << "    发送端丢失数据包: " << pktSndLossTotal << std::endl;
+        ss << "    接收端丢失数据包: " << pktRcvLossTotal << std::endl;
+        ss << "    重传数据包数: " << pktRetransTotal << std::endl;
+        ss << "    发送ACK包数: " << pktSentACKTotal << std::endl;
+        ss << "    接收ACK包数: " << pktRecvACKTotal << std::endl;
+        ss << "    发送NAK包数: " << pktSentNAKTotal << std::endl;
+        ss << "    接收NAK包数: " << pktRecvNAKTotal << std::endl;
+        if (estimated_data_packets > 0) {
+            ss << "    估计的数据包数: " << estimated_data_packets << " (基于文件大小和MSS)" << std::endl;
+        }
         ss << std::endl;
-        ss << "  即时性能:" << std::endl;
-        ss << "    UDT发送速率: " << mbpsSendRate << " Mbps" << std::endl;
-        ss << "    UDT接收速率: " << mbpsRecvRate << " Mbps" << std::endl;
+
+        ss << "  网络分析指标:" << std::endl;
+        ss << "    数据包丢包率: " << data_packet_loss_rate << "%" << std::endl;
+        ss << "    控制包开销比例: " << control_overhead_ratio << "%" << std::endl;
+        ss << "    网络传输效率: " << network_efficiency << "%" << std::endl;
+        ss << "    数据完整性评分: " << data_integrity_score << "/100" << std::endl;
+        ss << std::endl;
+
+        ss << "  即时性能（最后统计周期）:" << std::endl;
+        ss << "    发送包数: " << pktSent << std::endl;
+        ss << "    接收包数: " << pktRecv << std::endl;
+        ss << "    UDT报告发送速率: " << mbpsSendRate << " Mbps" << std::endl;
+        ss << "    UDT报告接收速率: " << mbpsRecvRate << " Mbps" << std::endl;
 
         return ss.str();
     }
@@ -457,7 +571,8 @@ void run_sender(const char* ip, int port, const char* filepath, const UDTConfig&
 
     // 初始化传输统计
     TransferStatistics stats;
-    stats.init(f_size);
+    stats.init(f_size, true); // 设置为发送端
+    stats.set_mss_for_estimation(config.mss); // 设置MSS用于估计数据包数
 
     // 1. 发送握手协商包
     HandshakePacket hp;
@@ -560,7 +675,8 @@ void run_receiver(int port, const char* save_path) {
 
     // 3. 初始化传输统计
     TransferStatistics stats;
-    stats.init(hp.file_size);
+    stats.init(hp.file_size, false); // 设置为接收端
+    stats.set_mss_for_estimation(hp.mss); // 设置MSS用于估计数据包数
     stats.start_time = std::chrono::steady_clock::now();
 
     // 4. 接收文件数据
@@ -663,15 +779,10 @@ int main(int argc, char* argv[]) {
         std::cerr << std::endl;
         std::cerr << "Enhanced Statistics Features:" << std::endl;
         std::cerr << "  - Real-time speed monitoring (min/max/average)" << std::endl;
-        std::cerr << "  - Complete packet statistics (sent/received/lost/retransmitted)" << std::endl;
-        std::cerr << std::endl;
-        std::cerr << "  - Loss rate and retransmission rate calculation" << std::endl;
-        std::cerr << std::endl;
-        std::cerr << "  - Transfer efficiency analysis (effective packets/total packets)" << std::endl;
-        std::cerr << std::endl;
-        std::cerr << "  - Time estimation for remaining transfer" << std::endl;
-        std::cerr << std::endl;
-        std::cerr << "  - Network quality assessment and suggestions" << std::endl;
+        std::cerr << "  - Complete packet statistics with analysis" << std::endl;
+        std::cerr << "  - Control packet overhead analysis" << std::endl;
+        std::cerr << "  - Network efficiency and data integrity scoring" << std::endl;
+        std::cerr << "  - Network quality assessment and recommendations" << std::endl;
     }
 
     UDT::cleanup();
