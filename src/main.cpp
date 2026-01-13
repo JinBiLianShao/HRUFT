@@ -1,3 +1,4 @@
+
 #include <iostream>
 #include <fstream>
 #include <cstring>
@@ -51,12 +52,13 @@ struct HandshakePacket {
 };
 #pragma pack(pop)
 
-// 传输结束确认包
+// 传输完成确认包
 #pragma pack(push, 1)
-struct FinishAckPacket {
-    int32_t ack_type;            // 0: 请求重传，1: 传输成功
-    int32_t missing_packets[256]; // 需要重传的数据块序号
-    int32_t missing_count;       // 缺失包数量
+struct TransferCompletePacket {
+    int32_t status;               // 0: 等待MD5校验, 1: MD5校验成功, 2: MD5校验失败
+    char md5[32];                 // 接收端计算的MD5
+    int64_t received_bytes;       // 接收端实际接收的字节数
+    int64_t missing_count;        // 缺失的包数量(如果有)
 };
 #pragma pack(pop)
 
@@ -759,68 +761,125 @@ void run_sender(const char* ip, int port, const char* filepath, const UDTConfig&
         return;
     }
 
-    // 传输完成后，进入关闭协商阶段
-    report_json("status", "message", "File transmission complete, initiating close handshake...");
+    // 文件数据发送完成
+    report_json("status", "message", "File data transmission complete, sending EOF marker...");
 
-    // 设置linger选项，等待未发送数据
-    bool linger = true;
-    int linger_time = 5000; // 5秒
-    UDT::setsockopt(client, 0, UDT_LINGER, &linger, sizeof(bool));
-
-    // 发送传输完成标记
-    const char* end_marker = "END_OF_FILE_TRANSMISSION";
-    if (UDT::ERROR == UDT::send(client, end_marker, strlen(end_marker), 0)) {
-        report_json("warning", "message", "Failed to send end marker");
+    // 发送文件传输结束标记
+    const char* eof_marker = "FILE_TRANSMISSION_COMPLETE_EOF";
+    if (UDT::ERROR == UDT::send(client, eof_marker, strlen(eof_marker) + 1, 0)) {
+        report_json("warning", "message", "Failed to send EOF marker");
+    } else {
+        report_json("status", "message", "EOF marker sent, waiting for receiver to finish...");
     }
 
-    // 等待接收端的确认（使用UDT_RCVTIMEO设置超时）
-    int timeout = 10000; // 10秒超时
+    // 设置接收超时（等待接收端完成接收和MD5校验）
+    int timeout = 60000; // 60秒超时，给接收端足够时间处理
     UDT::setsockopt(client, 0, UDT_RCVTIMEO, &timeout, sizeof(int));
 
-    char ack_buffer[32];
-    int ack_size = UDT::recv(client, ack_buffer, sizeof(ack_buffer), 0);
+    // 等待接收端完成接收并返回MD5校验结果
+    TransferCompletePacket tcp;
+    /*while (true) {
 
-    if (ack_size > 0) {
-        std::string ack_msg(ack_buffer, ack_size);
-        if (ack_msg == "RECEIVER_ACK") {
-            report_json("status", "message", "Receiver acknowledged completion.");
-        } else if (ack_msg == "RECEIVER_NAK") {
-            report_json("warning", "message", "Receiver requested retransmission.");
-            // 这里可以实现重传逻辑
-        } else {
-            report_json("warning", "message", "Unknown acknowledgment from receiver: " + ack_msg);
-        }
-    } else {
-        report_json("warning", "message", "No acknowledgment from receiver, proceeding to close.");
-    }
+    }*/
+    int recv_result = UDT::recv(client, (char*)&tcp, sizeof(TransferCompletePacket), 0);
 
-    // 传输完成，记录结束时间
+    // 记录结束时间
     stats.end_time = std::chrono::steady_clock::now();
     stats.transferred_bytes = total_sent;
 
-    // 最终收集统计信息
-    stats.collect_udt_stats(client);
+    if (recv_result == sizeof(TransferCompletePacket)) {
+        // 收集最终统计信息
+        stats.collect_udt_stats(client);
 
-    // 报告最终进度
-    report_progress(total_sent, f_size, 0, stats, true);
+        std::stringstream result_info;
+        result_info << "Receiver MD5 verification ";
 
-    // 输出详细统计信息
-    std::cout << stats.to_json() << std::endl;
+        if (tcp.status == 1) {
+            result_info << "PASSED! Received: " << tcp.received_bytes << " bytes";
+            report_json("success", "message", result_info.str());
 
-    // 输出人类可读的总结
-    std::cout << stats.summary() << std::endl;
+            // 比较MD5
+            std::string expected_md5(local_md5);
+            std::string actual_md5(tcp.md5, 32);
 
-    // 先让接收端关闭（重要！）
+            std::cout << "{\"type\":\"verify\", \"success\":true"
+                      << ", \"expected\":\"" << expected_md5
+                      << "\", \"actual\":\"" << actual_md5
+                      << "\", \"bytes_sent\":" << total_sent
+                      << ", \"bytes_received\":" << tcp.received_bytes
+                      << "}" << std::endl;
+        } else if (tcp.status == 2) {
+            result_info << "FAILED! Expected: " << local_md5
+                       << ", Got: " << std::string(tcp.md5, 32);
+            report_json("error", "message", result_info.str());
+
+            std::cout << "{\"type\":\"verify\", \"success\":false"
+                      << ", \"expected\":\"" << local_md5
+                      << "\", \"actual\":\"" << std::string(tcp.md5, 32)
+                      << "\", \"bytes_sent\":" << total_sent
+                      << ", \"bytes_received\":" << tcp.received_bytes
+                      << "}" << std::endl;
+        } else {
+            report_json("warning", "message", "Receiver verification status unknown: " + std::to_string(tcp.status));
+        }
+
+        // 发送统计信息给接收端
+        std::string stats_json = stats.to_json();
+        if (UDT::ERROR == UDT::send(client, stats_json.c_str(), (int)stats_json.length(), 0)) {
+            report_json("warning", "message", "Failed to send statistics to receiver");
+        }
+
+        // 等待接收端的关闭确认
+        char close_ack[32];
+        int ack_size = UDT::recv(client, close_ack, sizeof(close_ack), 0);
+        if (ack_size > 0) {
+            std::string ack_msg(close_ack, ack_size);
+            if (ack_msg == "RECEIVER_CLOSE_OK") {
+                report_json("status", "message", "Receiver ready to close connection");
+            } else {
+                report_json("warning", "message", "Unexpected close ack: " + ack_msg);
+            }
+        }
+
+        // 输出详细统计信息
+        std::cout << stats.to_json() << std::endl;
+        std::cout << stats.summary() << std::endl;
+
+    } else {
+        if (recv_result == UDT::ERROR) {
+            report_json("warning", "message", "No verification response from receiver (timeout or error)");
+        } else {
+            report_json("warning", "message", "Partial verification response from receiver, size: " + std::to_string(recv_result));
+        }
+
+        // 收集统计信息
+        stats.collect_udt_stats(client);
+
+        // 输出详细统计信息
+        std::cout << stats.to_json() << std::endl;
+        std::cout << stats.summary() << std::endl;
+    }
+
+    // 优雅关闭连接
+    report_json("status", "message", "Closing sender connection gracefully...");
+
+    // 设置linger选项确保所有数据发送完成
+    bool linger = true;
+    int linger_time = 5000;
+    UDT::setsockopt(client, 0, UDT_LINGER, &linger, sizeof(bool));
+
+    // 等待一小段时间让接收端处理
 #ifdef _WIN32
-    Sleep(50);
+    Sleep(100);
 #else
-    usleep(50 * 1000);
+    usleep(100 * 1000);
 #endif
 
-    report_json("status", "message", "Closing sender connection...");
-    ifs.close();
+    // 关闭连接
     UDT::close(client);
-    report_json("status", "message", "Sender connection closed gracefully.");
+    ifs.close();
+
+    report_json("status", "message", "Sender connection closed.");
 }
 
 // ==========================================
@@ -977,9 +1036,10 @@ void run_receiver(int port, const char* save_path) {
     std::vector<char> buffer(1024 * 64);
     auto last_time = std::chrono::steady_clock::now();
     long long last_bytes = 0;
-    bool received_end_marker = false;
+    bool received_eof_marker = false;
 
-    while (total_recv < hp.file_size && !received_end_marker) {
+    // 持续接收直到收到EOF标记
+    while (!received_eof_marker && total_recv < hp.file_size) {
         int rs = UDT::recv(recver, buffer.data(), (int)buffer.size(), 0);
         if (rs <= 0) {
             if (rs == UDT::ERROR) {
@@ -988,16 +1048,23 @@ void run_receiver(int port, const char* save_path) {
             break;
         }
 
-        // 检查是否收到结束标记
-        if (rs == strlen("END_OF_FILE_TRANSMISSION")) {
-            std::string received_data(buffer.data(), rs);
-            if (received_data == "END_OF_FILE_TRANSMISSION") {
-                report_json("status", "message", "Received end marker from sender.");
-                received_end_marker = true;
-                continue;
+        // 检查是否收到EOF标记
+        std::string received_data(buffer.data(), rs);
+        if (received_data.find("FILE_TRANSMISSION_COMPLETE_EOF") != std::string::npos) {
+            report_json("status", "message", "Received EOF marker from sender.");
+            received_eof_marker = true;
+
+            // 写入EOF标记之前的数据
+            size_t eof_pos = received_data.find("FILE_TRANSMISSION_COMPLETE_EOF");
+            if (eof_pos > 0) {
+                ofs.write(buffer.data(), eof_pos);
+                total_recv += eof_pos;
+                stats.update_speed(eof_pos);
             }
+            break;
         }
 
+        // 写入正常数据
         ofs.write(buffer.data(), rs);
         if (!ofs) {
             report_json("error", "message", "Failed to write to file");
@@ -1021,26 +1088,109 @@ void run_receiver(int port, const char* save_path) {
             stats.collect_udt_stats(recver);
         }
     }
+
+    // 如果没有收到EOF标记但已经收到所有数据
+    if (!received_eof_marker && total_recv >= hp.file_size) {
+        report_json("warning", "message", "Received all data but no EOF marker, waiting for marker...");
+
+        // 继续接收，等待EOF标记
+        while (!received_eof_marker) {
+            char eof_buffer[256];
+            int rs = UDT::recv(recver, eof_buffer, sizeof(eof_buffer), 0);
+            if (rs <= 0) break;
+
+            std::string received_data(eof_buffer, rs);
+            if (received_data.find("FILE_TRANSMISSION_COMPLETE_EOF") != std::string::npos) {
+                report_json("status", "message", "Received EOF marker from sender.");
+                received_eof_marker = true;
+                break;
+            }
+        }
+    }
+
     ofs.close();
 
-    // 检查文件完整性
+    // 检查文件完整性并计算MD5
     bool transfer_complete = false;
-    if (total_recv >= hp.file_size) {
-        report_json("status", "message", "File received completely.");
-        transfer_complete = true;
+    std::string actual_md5;
 
-        // 发送确认给发送端
-        const char* ack_msg = "RECEIVER_ACK";
-        if (UDT::ERROR == UDT::send(recver, ack_msg, strlen(ack_msg), 0)) {
-            report_json("warning", "message", "Failed to send acknowledgment");
+    if (total_recv >= hp.file_size) {
+        report_json("status", "message", "File received completely, verifying MD5...");
+
+        // 计算MD5
+        actual_md5 = calculate_file_md5(final_save_path);
+        std::string expected_md5(hp.md5, 32);
+
+        bool md5_match = (actual_md5 == expected_md5);
+        transfer_complete = md5_match;
+
+        // 发送MD5校验结果给发送端
+        TransferCompletePacket tcp;
+        tcp.status = md5_match ? 1 : 2;
+        tcp.received_bytes = total_recv;
+        tcp.missing_count = (hp.file_size - total_recv) > 0 ? (hp.file_size - total_recv) : 0;
+
+        // 复制MD5
+        memset(tcp.md5, 0, sizeof(tcp.md5));
+        if (!actual_md5.empty() && actual_md5.length() >= 32) {
+            memcpy(tcp.md5, actual_md5.c_str(), 32);
         }
+
+        // 设置发送超时
+        int send_timeout = 5000;
+        UDT::setsockopt(recver, 0, UDT_SNDTIMEO, &send_timeout, sizeof(int));
+
+        if (UDT::ERROR == UDT::send(recver, (char*)&tcp, sizeof(TransferCompletePacket), 0)) {
+            report_json("warning", "message", "Failed to send verification result to sender");
+        } else {
+            if (md5_match) {
+                report_json("success", "message", "MD5 verification passed!");
+            } else {
+                report_json("error", "message", "MD5 verification failed!");
+            }
+
+            // 等待发送端的统计信息
+            char stats_buffer[65536]; // 足够大的缓冲区
+            int stats_size = UDT::recv(recver, stats_buffer, sizeof(stats_buffer), 0);
+
+            if (stats_size > 0) {
+                std::string stats_json(stats_buffer, stats_size);
+                try {
+                    // 解析并保存发送端的统计信息
+                    std::cout << stats_json << std::endl;
+                    report_json("status", "message", "Received sender statistics");
+                } catch (...) {
+                    report_json("warning", "message", "Failed to parse sender statistics");
+                }
+            }
+
+            // 发送关闭确认
+            const char* close_ack = "RECEIVER_CLOSE_OK";
+            if (UDT::ERROR == UDT::send(recver, close_ack, strlen(close_ack), 0)) {
+                report_json("warning", "message", "Failed to send close acknowledgment");
+            }
+        }
+
     } else {
         report_json("error", "message", "File incomplete: " + std::to_string(total_recv) + "/" + std::to_string(hp.file_size));
 
-        // 发送否定确认给发送端
-        const char* nak_msg = "RECEIVER_NAK";
-        if (UDT::ERROR == UDT::send(recver, nak_msg, strlen(nak_msg), 0)) {
-            report_json("warning", "message", "Failed to send negative acknowledgment");
+        // 发送失败状态
+        TransferCompletePacket tcp;
+        tcp.status = 2; // 失败
+        tcp.received_bytes = total_recv;
+        tcp.missing_count = hp.file_size - total_recv;
+        memset(tcp.md5, 0, sizeof(tcp.md5));
+
+        UDT::send(recver, (char*)&tcp, sizeof(TransferCompletePacket), 0);
+
+        // 删除不完整的文件
+        try {
+            if (std::filesystem::exists(final_save_path)) {
+                std::filesystem::remove(final_save_path);
+                report_json("status", "message", "Deleted incomplete file: " + final_save_path);
+            }
+        } catch (...) {
+            // 忽略删除错误
         }
     }
 
@@ -1054,10 +1204,8 @@ void run_receiver(int port, const char* save_path) {
     // 报告最终进度
     report_progress(total_recv, hp.file_size, 0, stats, true);
 
-    // 输出详细统计信息
+    // 输出本地统计信息
     std::cout << stats.to_json() << std::endl;
-
-    // 输出人类可读的总结
     std::cout << stats.summary() << std::endl;
 
     // 设置linger确保所有数据发送完成
@@ -1065,42 +1213,30 @@ void run_receiver(int port, const char* save_path) {
     int linger_time = 3000;
     UDT::setsockopt(recver, 0, UDT_LINGER, &linger, sizeof(bool));
 
-    // 接收端先关闭连接
-    report_json("status", "message", "Closing receiver connection...");
+    // 等待一小段时间确保发送端已经关闭
+#ifdef _WIN32
+    Sleep(50);
+#else
+    usleep(50 * 1000);
+#endif
+
+    // 接收端关闭连接
+    report_json("status", "message", "Closing receiver connection gracefully...");
     UDT::close(recver);
-    report_json("status", "message", "Receiver connection closed.");
 
     // 关闭服务器socket
     UDT::close(serv);
 
-    // 5. 校验 MD5（如果传输完成）
+    report_json("status", "message", "Receiver connection closed.");
+
+    // 输出最终的MD5校验结果（如果传输完成）
     if (transfer_complete) {
-        report_json("status", "message", "Verifying MD5...");
-        std::string actual_md5 = calculate_file_md5(final_save_path);
-        std::string expected_md5(hp.md5, 32);
-        bool success = (actual_md5 == expected_md5);
-
-        if (success) {
-            report_json("status", "message", "MD5 verification passed!");
-        } else {
-            report_json("error", "message", "MD5 verification failed!");
-        }
-
-        std::cout << "{\"type\":\"verify\", \"success\":" << (success ? "true" : "false")
-                  << ", \"expected\":\"" << expected_md5 << "\", \"actual\":\"" << actual_md5
-                  << "\", \"file_path\":\"" << final_save_path << "\"}" << std::endl;
-    } else {
-        report_json("warning", "message", "Skipping MD5 verification due to incomplete transfer");
-
-        // 删除不完整的文件
-        try {
-            if (std::filesystem::exists(final_save_path)) {
-                std::filesystem::remove(final_save_path);
-                report_json("status", "message", "Deleted incomplete file: " + final_save_path);
-            }
-        } catch (...) {
-            // 忽略删除错误
-        }
+        std::cout << "{\"type\":\"final_verify\", \"success\":true"
+                  << ", \"expected\":\"" << std::string(hp.md5, 32)
+                  << "\", \"actual\":\"" << actual_md5
+                  << "\", \"file_path\":\"" << final_save_path
+                  << "\", \"bytes_expected\":" << hp.file_size
+                  << ", \"bytes_received\":" << total_recv << "}" << std::endl;
     }
 }
 
