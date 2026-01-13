@@ -11,15 +11,23 @@
 #include <sstream>
 #include <cmath>
 #include <queue>
+#include <limits>
+#include <unordered_map>
+#include <ctime>
+#include <thread>
+#include <filesystem>
+#include <unistd.h>
 
 #ifdef _WIN32
 #include <winsock2.h>
-#include <ws2tcpip.h> // inet_pton 定义在这里
+#include <ws2tcpip.h>
 #include <windows.h>
+#include <direct.h>
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #endif
 
 #include "udt.h"
@@ -32,10 +40,23 @@
 // 握手包结构：确保两端按同样的字节序解析
 #pragma pack(push, 1)
 struct HandshakePacket {
-    long long file_size; // 文件总大小
-    char md5[32]; // MD5 字符串
-    int mss; // 发送端指定的 MSS
-    int window_size; // 发送端指定的 Window Size
+    long long file_size;          // 文件总大小
+    char md5[32];                 // MD5字符串
+    int mss;                      // 发送端指定的MSS
+    int window_size;              // 发送端指定的Window Size
+    char filename[256];           // 文件名
+    char file_extension[16];      // 文件扩展名（格式）
+    char mime_type[64];           // MIME类型（可选）
+    uint8_t has_mime_type;        // 是否有MIME类型
+};
+#pragma pack(pop)
+
+// 传输结束确认包
+#pragma pack(push, 1)
+struct FinishAckPacket {
+    int32_t ack_type;            // 0: 请求重传，1: 传输成功
+    int32_t missing_packets[256]; // 需要重传的数据块序号
+    int32_t missing_count;       // 缺失包数量
 };
 #pragma pack(pop)
 
@@ -68,7 +89,7 @@ struct TransferStatistics {
     double current_speed_mbps = 0.0;
     double average_speed_mbps = 0.0;
     double max_speed_mbps = 0.0;
-    double min_speed_mbps = 0.0;
+    double min_speed_mbps = std::numeric_limits<double>::max();
 
     // 平滑速度计算的队列
     std::queue<double> speed_history;
@@ -280,57 +301,41 @@ struct TransferStatistics {
         if (is_sender) {
             // 发送端统计
             if (pktSentTotal > 0) {
-                // 数据包丢包率：丢失的数据包 / 发送的数据包
+                // 数据包丢包率：发送端报告的丢包数 / 发送的总包数
                 data_packet_loss_rate = (pktSndLossTotal * 100.0) / pktSentTotal;
 
-                // 控制包开销：接收的ACK+NAK包 / 发送的数据包
+                // 控制包开销比例：(ACK+NAK接收数) / 总发送包数
                 int64_t control_packets_received = pktRecvACKTotal + pktRecvNAKTotal;
-                if (pktSentTotal > 0) {
-                    control_overhead_ratio = (control_packets_received * 100.0) / pktSentTotal;
-                }
+                control_overhead_ratio = (control_packets_received * 100.0) / pktSentTotal;
 
-                // 网络传输效率：(发送的有效数据包 - 重传包) / 发送的总数据包
-                if (pktSentTotal > 0) {
-                    network_efficiency = ((pktSentTotal - pktRetransTotal) * 100.0) / pktSentTotal;
-                }
-
-                // 数据完整性评分（基于丢包率和重传率）
-                data_integrity_score = 100.0 - (data_packet_loss_rate + (pktRetransTotal * 100.0 / pktSentTotal) / 2);
-                if (data_integrity_score < 0) data_integrity_score = 0;
-                if (data_integrity_score > 100) data_integrity_score = 100;
-            }
-        } else {
-            // 接收端统计
-            // 首先，我们需要估计接收到的数据包数（排除控制包）
-            // UDT的pktRecvTotal包括了所有接收到的包（数据包+控制包）
-
-            // 估计的数据包数（基于文件大小和MSS）
-            if (estimated_data_packets > 0) {
-                // 估计接收到的数据包数（排除控制包开销）
-                int64_t estimated_control_packets = pktSentACKTotal + pktSentNAKTotal;
-                int64_t estimated_data_packets_received = pktRecvTotal - estimated_control_packets;
-                if (estimated_data_packets_received < 0) estimated_data_packets_received = 0;
-
-                // 数据包丢包率
-                if (estimated_data_packets > 0) {
-                    data_packet_loss_rate = (pktRcvLossTotal * 100.0) / estimated_data_packets;
-                }
-
-                // 控制包开销：发送的ACK+NAK包 / 估计的数据包数
-                if (estimated_data_packets > 0) {
-                    control_overhead_ratio = ((pktSentACKTotal + pktSentNAKTotal) * 100.0) / estimated_data_packets;
-                }
-
-                // 网络传输效率：基于实际接收的数据完整性
-                if (estimated_data_packets > 0) {
-                    network_efficiency = ((estimated_data_packets - pktRcvLossTotal) * 100.0) / estimated_data_packets;
-                }
+                // 网络传输效率：(总发送包数 - 重传包数) / 总发送包数
+                network_efficiency = ((pktSentTotal - pktRetransTotal) * 100.0) / pktSentTotal;
 
                 // 数据完整性评分
-                data_integrity_score = 100.0 - data_packet_loss_rate;
-                if (data_integrity_score < 0) data_integrity_score = 0;
-                if (data_integrity_score > 100) data_integrity_score = 100;
+                data_integrity_score = 100.0 - (data_packet_loss_rate + (pktRetransTotal * 100.0 / pktSentTotal) / 2.0);
+                data_integrity_score = std::max(0.0, std::min(100.0, data_integrity_score));
             }
+        } else {
+            // 接收端统计 - 基于UDT实际统计数据
+            // UDT的pktRecvTotal包括所有接收到的包（数据包+控制包）
+            // 但接收端主要处理数据包，控制包开销体现在发送的ACK/NAK中
+
+            // 数据包丢包率：接收端报告的丢包数 / (接收包数 + 报告丢包数)
+            if ((pktRecvTotal + pktRcvLossTotal) > 0) {
+                data_packet_loss_rate = (pktRcvLossTotal * 100.0) / (pktRecvTotal + pktRcvLossTotal);
+            }
+
+            // 控制包开销：发送的ACK+NAK包 / 接收包数
+            if (pktRecvTotal > 0) {
+                control_overhead_ratio = ((pktSentACKTotal + pktSentNAKTotal) * 100.0) / pktRecvTotal;
+            }
+
+            // 网络传输效率：基于丢包率
+            network_efficiency = 100.0 - data_packet_loss_rate;
+
+            // 数据完整性评分
+            data_integrity_score = 100.0 - data_packet_loss_rate;
+            data_integrity_score = std::max(0.0, std::min(100.0, data_integrity_score));
         }
     }
 
@@ -479,6 +484,54 @@ struct TransferStatistics {
 // 辅助工具
 // ==========================================
 
+// 获取文件MIME类型
+std::string get_mime_type_from_extension(const std::string& extension) {
+    static const std::unordered_map<std::string, std::string> mime_map = {
+        {".txt", "text/plain"},
+        {".jpg", "image/jpeg"},
+        {".jpeg", "image/jpeg"},
+        {".png", "image/png"},
+        {".pdf", "application/pdf"},
+        {".zip", "application/zip"},
+        {".rar", "application/x-rar-compressed"},
+        {".7z", "application/x-7z-compressed"},
+        {".tar", "application/x-tar"},
+        {".gz", "application/gzip"},
+        {".bz2", "application/x-bzip2"},
+        {".mp4", "video/mp4"},
+        {".avi", "video/x-msvideo"},
+        {".mkv", "video/x-matroska"},
+        {".mp3", "audio/mpeg"},
+        {".wav", "audio/wav"},
+        {".flac", "audio/flac"},
+        {".doc", "application/msword"},
+        {".docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
+        {".xls", "application/vnd.ms-excel"},
+        {".xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+        {".ppt", "application/vnd.ms-powerpoint"},
+        {".pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"},
+        {".html", "text/html"},
+        {".htm", "text/html"},
+        {".css", "text/css"},
+        {".js", "application/javascript"},
+        {".json", "application/json"},
+        {".xml", "application/xml"},
+        {".csv", "text/csv"},
+        {".exe", "application/x-msdownload"},
+        {".dll", "application/x-msdownload"},
+        {".so", "application/x-sharedlib"},
+        {".deb", "application/x-debian-package"},
+        {".rpm", "application/x-rpm"},
+        {".iso", "application/x-iso9660-image"}
+    };
+
+    std::string ext_lower = extension;
+    std::transform(ext_lower.begin(), ext_lower.end(), ext_lower.begin(), ::tolower);
+
+    auto it = mime_map.find(ext_lower);
+    return (it != mime_map.end()) ? it->second : "application/octet-stream";
+}
+
 void report_json(const std::string &type, const std::string &key, const std::string &val) {
     std::cout << "{\"type\":\"" << type << "\", \"" << key << "\":\"" << val << "\"}" << std::endl;
 }
@@ -538,6 +591,19 @@ void apply_socket_opts(UDTSOCKET sock, int mss, int win_size) {
     UDT::setsockopt(sock, 0, UDT_FC, &fc, sizeof(int));
 }
 
+// 确保目录存在
+bool ensure_directory_exists(const std::string& dir_path) {
+    try {
+        if (!std::filesystem::exists(dir_path)) {
+            return std::filesystem::create_directories(dir_path);
+        }
+        return true;
+    } catch (const std::exception& e) {
+        report_json("error", "message", "Failed to create directory: " + std::string(e.what()));
+        return false;
+    }
+}
+
 // ==========================================
 // 发送端逻辑
 // ==========================================
@@ -546,33 +612,73 @@ void run_sender(const char* ip, int port, const char* filepath, const UDTConfig&
     report_json("status", "message", "Calculating MD5...");
     std::string local_md5 = calculate_file_md5(filepath);
     if (local_md5.empty()) {
-        report_json("error", "message", "File error");
+        report_json("error", "message", "File error or not found");
         return;
     }
 
     UDTSOCKET client = UDT::socket(AF_INET, SOCK_STREAM, 0);
-    // 连接前先应用本地配置（用于建立连接的策略）
+    if (client == UDT::INVALID_SOCK) {
+        report_json("error", "message", "Failed to create UDT socket");
+        return;
+    }
+
+    // 连接前先应用本地配置
     apply_socket_opts(client, config.mss, config.window_size);
 
     sockaddr_in serv_addr;
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_port = htons(port);
-    inet_pton(AF_INET, ip, &serv_addr.sin_addr);
+    if (inet_pton(AF_INET, ip, &serv_addr.sin_addr) <= 0) {
+        report_json("error", "message", "Invalid IP address");
+        UDT::close(client);
+        return;
+    }
 
     report_json("status", "message", "Connecting...");
     if (UDT::ERROR == UDT::connect(client, (sockaddr*)&serv_addr, sizeof(serv_addr))) {
         report_json("error", "message", UDT::getlasterror().getErrorMessage());
+        UDT::close(client);
         return;
     }
 
     std::ifstream ifs(filepath, std::ios::binary | std::ios::ate);
+    if (!ifs) {
+        report_json("error", "message", "Cannot open file for reading");
+        UDT::close(client);
+        return;
+    }
+
     long long f_size = ifs.tellg();
     ifs.seekg(0, std::ios::beg);
+
+    // 提取文件信息
+    std::filesystem::path file_path(filepath);
+    std::string filename = file_path.filename().string();
+    std::string extension = file_path.extension().string();
+    std::string mime_type = get_mime_type_from_extension(extension);
+
+    // 确保不会溢出
+    if (filename.length() >= 256) {
+        filename = filename.substr(0, 255);
+    }
+    if (extension.length() >= 16) {
+        extension = extension.substr(0, 15);
+    }
+    if (mime_type.length() >= 64) {
+        mime_type = mime_type.substr(0, 63);
+    }
+
+    // 报告文件信息
+    std::stringstream file_info;
+    file_info << "Sending file: " << filename << " (" << (f_size / 1024.0 / 1024.0) << " MB)";
+    if (!extension.empty()) file_info << " Type: " << extension;
+    if (!mime_type.empty()) file_info << " MIME: " << mime_type;
+    report_json("status", "message", file_info.str());
 
     // 初始化传输统计
     TransferStatistics stats;
     stats.init(f_size, true); // 设置为发送端
-    stats.set_mss_for_estimation(config.mss); // 设置MSS用于估计数据包数
+    stats.set_mss_for_estimation(config.mss);
 
     // 1. 发送握手协商包
     HandshakePacket hp;
@@ -581,7 +687,22 @@ void run_sender(const char* ip, int port, const char* filepath, const UDTConfig&
     hp.window_size = config.window_size;
     memcpy(hp.md5, local_md5.c_str(), 32);
 
-    UDT::send(client, (char*)&hp, sizeof(HandshakePacket), 0);
+    // 清空字符串字段
+    memset(hp.filename, 0, sizeof(hp.filename));
+    memset(hp.file_extension, 0, sizeof(hp.file_extension));
+    memset(hp.mime_type, 0, sizeof(hp.mime_type));
+
+    // 复制文件信息
+    strncpy(hp.filename, filename.c_str(), sizeof(hp.filename) - 1);
+    strncpy(hp.file_extension, extension.c_str(), sizeof(hp.file_extension) - 1);
+    strncpy(hp.mime_type, mime_type.c_str(), sizeof(hp.mime_type) - 1);
+    hp.has_mime_type = !mime_type.empty() ? 1 : 0;
+
+    if (UDT::ERROR == UDT::send(client, (char*)&hp, sizeof(HandshakePacket), 0)) {
+        report_json("error", "message", "Failed to send handshake packet");
+        UDT::close(client);
+        return;
+    }
     stats.transferred_bytes += sizeof(HandshakePacket);
 
     // 2. 开始传输数据
@@ -601,12 +722,20 @@ void run_sender(const char* ip, int port, const char* filepath, const UDTConfig&
         int offset = 0;
         while (offset < read_len) {
             int sent = UDT::send(client, buffer.data() + offset, read_len - offset, 0);
-            if (sent <= 0) break;
+            if (sent <= 0) {
+                report_json("error", "message", "Failed to send data");
+                break;
+            }
             offset += sent;
             total_sent += sent;
 
             // 更新速度统计（累积字节数）
             stats.update_speed(sent);
+        }
+
+        if (offset < read_len) {
+            // 发送失败，退出循环
+            break;
         }
 
         auto now = std::chrono::steady_clock::now();
@@ -620,6 +749,49 @@ void run_sender(const char* ip, int port, const char* filepath, const UDTConfig&
             // 收集UDT性能统计
             stats.collect_udt_stats(client);
         }
+    }
+
+    // 检查是否传输完成
+    if (total_sent < f_size) {
+        report_json("error", "message", "File transmission incomplete: " + std::to_string(total_sent) + "/" + std::to_string(f_size));
+        ifs.close();
+        UDT::close(client);
+        return;
+    }
+
+    // 传输完成后，进入关闭协商阶段
+    report_json("status", "message", "File transmission complete, initiating close handshake...");
+
+    // 设置linger选项，等待未发送数据
+    bool linger = true;
+    int linger_time = 5000; // 5秒
+    UDT::setsockopt(client, 0, UDT_LINGER, &linger, sizeof(bool));
+
+    // 发送传输完成标记
+    const char* end_marker = "END_OF_FILE_TRANSMISSION";
+    if (UDT::ERROR == UDT::send(client, end_marker, strlen(end_marker), 0)) {
+        report_json("warning", "message", "Failed to send end marker");
+    }
+
+    // 等待接收端的确认（使用UDT_RCVTIMEO设置超时）
+    int timeout = 10000; // 10秒超时
+    UDT::setsockopt(client, 0, UDT_RCVTIMEO, &timeout, sizeof(int));
+
+    char ack_buffer[32];
+    int ack_size = UDT::recv(client, ack_buffer, sizeof(ack_buffer), 0);
+
+    if (ack_size > 0) {
+        std::string ack_msg(ack_buffer, ack_size);
+        if (ack_msg == "RECEIVER_ACK") {
+            report_json("status", "message", "Receiver acknowledged completion.");
+        } else if (ack_msg == "RECEIVER_NAK") {
+            report_json("warning", "message", "Receiver requested retransmission.");
+            // 这里可以实现重传逻辑
+        } else {
+            report_json("warning", "message", "Unknown acknowledgment from receiver: " + ack_msg);
+        }
+    } else {
+        report_json("warning", "message", "No acknowledgment from receiver, proceeding to close.");
     }
 
     // 传输完成，记录结束时间
@@ -638,10 +810,17 @@ void run_sender(const char* ip, int port, const char* filepath, const UDTConfig&
     // 输出人类可读的总结
     std::cout << stats.summary() << std::endl;
 
-    report_json("status", "message", "Transfer complete.");
+    // 先让接收端关闭（重要！）
+#ifdef _WIN32
+    Sleep(50);
+#else
+    usleep(50 * 1000);
+#endif
 
+    report_json("status", "message", "Closing sender connection...");
     ifs.close();
     UDT::close(client);
+    report_json("status", "message", "Sender connection closed gracefully.");
 }
 
 // ==========================================
@@ -650,46 +829,181 @@ void run_sender(const char* ip, int port, const char* filepath, const UDTConfig&
 
 void run_receiver(int port, const char* save_path) {
     UDTSOCKET serv = UDT::socket(AF_INET, SOCK_STREAM, 0);
+    if (serv == UDT::INVALID_SOCK) {
+        report_json("error", "message", "Failed to create UDT server socket");
+        return;
+    }
 
     sockaddr_in my_addr;
     my_addr.sin_family = AF_INET;
     my_addr.sin_port = htons(port);
     my_addr.sin_addr.s_addr = INADDR_ANY;
 
-    UDT::bind(serv, (sockaddr*)&my_addr, sizeof(my_addr));
-    UDT::listen(serv, 5);
-    report_json("status", "message", "Waiting for sender...");
+    if (UDT::ERROR == UDT::bind(serv, (sockaddr*)&my_addr, sizeof(my_addr))) {
+        report_json("error", "message", "Failed to bind socket: " + std::string(UDT::getlasterror().getErrorMessage()));
+        UDT::close(serv);
+        return;
+    }
+
+    if (UDT::ERROR == UDT::listen(serv, 5)) {
+        report_json("error", "message", "Failed to listen on socket");
+        UDT::close(serv);
+        return;
+    }
+
+    report_json("status", "message", "Waiting for sender on port " + std::to_string(port) + "...");
 
     sockaddr_in client_addr;
     int namelen = sizeof(client_addr);
     UDTSOCKET recver = UDT::accept(serv, (sockaddr*)&client_addr, &namelen);
+    if (recver == UDT::INVALID_SOCK) {
+        report_json("error", "message", "Failed to accept connection");
+        UDT::close(serv);
+        return;
+    }
 
-    // 1. 接收协商包
+    char client_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
+    report_json("status", "message", "Connected to sender: " + std::string(client_ip));
+
+    // 1. 接收握手包
     HandshakePacket hp;
-    UDT::recv(recver, (char*)&hp, sizeof(HandshakePacket), 0);
+    if (UDT::ERROR == UDT::recv(recver, (char*)&hp, sizeof(HandshakePacket), 0)) {
+        report_json("error", "message", "Failed to receive handshake packet");
+        UDT::close(recver);
+        UDT::close(serv);
+        return;
+    }
 
-    // 2. 关键：根据发送端的建议动态调整接收端 Socket
+    // 2. 根据发送端的建议动态调整接收端 Socket
     report_json("status", "message",
-        "Syncing config: MSS=" + std::to_string(hp.mss) + ", WIN=" + std::to_string(hp.window_size));
+        "Syncing config from sender: MSS=" + std::to_string(hp.mss) + ", WIN=" + std::to_string(hp.window_size));
     apply_socket_opts(recver, hp.mss, hp.window_size);
+
+    // 从握手包获取文件信息
+    std::string received_filename = std::string(hp.filename, strnlen(hp.filename, sizeof(hp.filename)));
+    std::string received_extension = std::string(hp.file_extension, strnlen(hp.file_extension, sizeof(hp.file_extension)));
+    std::string mime_type = hp.has_mime_type ?
+        std::string(hp.mime_type, strnlen(hp.mime_type, sizeof(hp.mime_type))) : "";
+
+    // 构建保存路径
+    std::filesystem::path save_path_obj(save_path);
+    std::string final_save_path;
+
+    // 检查用户指定的是目录还是文件路径
+    bool is_directory = false;
+    try {
+        if (std::filesystem::exists(save_path_obj)) {
+            is_directory = std::filesystem::is_directory(save_path_obj);
+        } else {
+            // 如果路径不存在，检查是否有扩展名来判断
+            is_directory = save_path_obj.extension().empty();
+        }
+    } catch (...) {
+        // 默认按目录处理
+        is_directory = true;
+    }
+
+    if (is_directory) {
+        // 用户指定的是目录
+        if (!ensure_directory_exists(save_path)) {
+            UDT::close(recver);
+            UDT::close(serv);
+            return;
+        }
+
+        // 如果文件名为空，生成一个默认名
+        if (received_filename.empty()) {
+            std::time_t now = std::time(nullptr);
+            received_filename = "received_file_" + std::to_string(now);
+        }
+
+        // 如果有扩展名但文件名中没有，添加扩展名
+        if (!received_extension.empty()) {
+            std::filesystem::path filename_path(received_filename);
+            if (filename_path.extension().empty()) {
+                received_filename += received_extension;
+            }
+        }
+
+        save_path_obj /= received_filename;
+        final_save_path = save_path_obj.string();
+    } else {
+        // 用户指定的是具体文件路径
+        final_save_path = save_path;
+
+        // 如果没有扩展名而我们有，添加扩展名
+        if (!received_extension.empty() && save_path_obj.extension().empty()) {
+            save_path_obj.replace_extension(received_extension);
+            final_save_path = save_path_obj.string();
+        }
+    }
+
+    // 确保目录存在（如果是嵌套目录）
+    try {
+        std::filesystem::path parent_dir = std::filesystem::path(final_save_path).parent_path();
+        if (!parent_dir.empty()) {
+            ensure_directory_exists(parent_dir.string());
+        }
+    } catch (...) {
+        // 忽略目录创建错误，让文件创建失败时再报错
+    }
+
+    // 报告文件信息
+    std::stringstream info;
+    info << "Receiving file: " << received_filename;
+    if (!received_extension.empty()) info << " (" << received_extension << ")";
+    info << " [" << (hp.file_size / 1024.0 / 1024.0) << " MB]";
+    if (!mime_type.empty()) info << " MIME: " << mime_type;
+    info << " -> " << final_save_path;
+    report_json("status", "message", info.str());
 
     // 3. 初始化传输统计
     TransferStatistics stats;
     stats.init(hp.file_size, false); // 设置为接收端
-    stats.set_mss_for_estimation(hp.mss); // 设置MSS用于估计数据包数
+    stats.set_mss_for_estimation(hp.mss);
     stats.start_time = std::chrono::steady_clock::now();
 
     // 4. 接收文件数据
-    std::ofstream ofs(save_path, std::ios::binary);
+    std::ofstream ofs(final_save_path, std::ios::binary);
+    if (!ofs) {
+        report_json("error", "message", "Cannot create file: " + final_save_path);
+        UDT::close(recver);
+        UDT::close(serv);
+        return;
+    }
+
     long long total_recv = 0;
     std::vector<char> buffer(1024 * 64);
     auto last_time = std::chrono::steady_clock::now();
     long long last_bytes = 0;
+    bool received_end_marker = false;
 
-    while (total_recv < hp.file_size) {
+    while (total_recv < hp.file_size && !received_end_marker) {
         int rs = UDT::recv(recver, buffer.data(), (int)buffer.size(), 0);
-        if (rs <= 0) break;
+        if (rs <= 0) {
+            if (rs == UDT::ERROR) {
+                report_json("warning", "message", "Receive error: " + std::string(UDT::getlasterror().getErrorMessage()));
+            }
+            break;
+        }
+
+        // 检查是否收到结束标记
+        if (rs == strlen("END_OF_FILE_TRANSMISSION")) {
+            std::string received_data(buffer.data(), rs);
+            if (received_data == "END_OF_FILE_TRANSMISSION") {
+                report_json("status", "message", "Received end marker from sender.");
+                received_end_marker = true;
+                continue;
+            }
+        }
+
         ofs.write(buffer.data(), rs);
+        if (!ofs) {
+            report_json("error", "message", "Failed to write to file");
+            break;
+        }
+
         total_recv += rs;
 
         // 更新速度统计（累积字节数）
@@ -709,6 +1023,27 @@ void run_receiver(int port, const char* save_path) {
     }
     ofs.close();
 
+    // 检查文件完整性
+    bool transfer_complete = false;
+    if (total_recv >= hp.file_size) {
+        report_json("status", "message", "File received completely.");
+        transfer_complete = true;
+
+        // 发送确认给发送端
+        const char* ack_msg = "RECEIVER_ACK";
+        if (UDT::ERROR == UDT::send(recver, ack_msg, strlen(ack_msg), 0)) {
+            report_json("warning", "message", "Failed to send acknowledgment");
+        }
+    } else {
+        report_json("error", "message", "File incomplete: " + std::to_string(total_recv) + "/" + std::to_string(hp.file_size));
+
+        // 发送否定确认给发送端
+        const char* nak_msg = "RECEIVER_NAK";
+        if (UDT::ERROR == UDT::send(recver, nak_msg, strlen(nak_msg), 0)) {
+            report_json("warning", "message", "Failed to send negative acknowledgment");
+        }
+    }
+
     // 传输完成，记录结束时间
     stats.end_time = std::chrono::steady_clock::now();
     stats.transferred_bytes = total_recv;
@@ -725,17 +1060,48 @@ void run_receiver(int port, const char* save_path) {
     // 输出人类可读的总结
     std::cout << stats.summary() << std::endl;
 
-    // 5. 校验 MD5
-    report_json("status", "message", "Verifying MD5...");
-    std::string actual_md5 = calculate_file_md5(save_path);
-    std::string expected_md5(hp.md5, 32);
-    bool success = (actual_md5 == expected_md5);
+    // 设置linger确保所有数据发送完成
+    bool linger = true;
+    int linger_time = 3000;
+    UDT::setsockopt(recver, 0, UDT_LINGER, &linger, sizeof(bool));
 
-    std::cout << "{\"type\":\"verify\", \"success\":" << (success ? "true" : "false")
-              << ", \"expected\":\"" << expected_md5 << "\", \"actual\":\"" << actual_md5 << "\"}" << std::endl;
-
+    // 接收端先关闭连接
+    report_json("status", "message", "Closing receiver connection...");
     UDT::close(recver);
+    report_json("status", "message", "Receiver connection closed.");
+
+    // 关闭服务器socket
     UDT::close(serv);
+
+    // 5. 校验 MD5（如果传输完成）
+    if (transfer_complete) {
+        report_json("status", "message", "Verifying MD5...");
+        std::string actual_md5 = calculate_file_md5(final_save_path);
+        std::string expected_md5(hp.md5, 32);
+        bool success = (actual_md5 == expected_md5);
+
+        if (success) {
+            report_json("status", "message", "MD5 verification passed!");
+        } else {
+            report_json("error", "message", "MD5 verification failed!");
+        }
+
+        std::cout << "{\"type\":\"verify\", \"success\":" << (success ? "true" : "false")
+                  << ", \"expected\":\"" << expected_md5 << "\", \"actual\":\"" << actual_md5
+                  << "\", \"file_path\":\"" << final_save_path << "\"}" << std::endl;
+    } else {
+        report_json("warning", "message", "Skipping MD5 verification due to incomplete transfer");
+
+        // 删除不完整的文件
+        try {
+            if (std::filesystem::exists(final_save_path)) {
+                std::filesystem::remove(final_save_path);
+                report_json("status", "message", "Deleted incomplete file: " + final_save_path);
+            }
+        } catch (...) {
+            // 忽略删除错误
+        }
+    }
 }
 
 // ==========================================
@@ -746,45 +1112,115 @@ int main(int argc, char* argv[]) {
 #ifdef _WIN32
     // 强制设置控制台输出代码页为 UTF-8 (65001)
     SetConsoleOutputCP(65001);
+
+    // 初始化Winsock
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        std::cerr << "WSAStartup failed" << std::endl;
+        return 1;
+    }
 #endif
+
     // 添加命令行参数解析
     bool detailed_stats = false;
 
     UDT::startup();
-    if (argc < 2) return 1;
+
+    if (argc < 2) {
+        std::cerr << "Error: No arguments provided" << std::endl;
+        std::cerr << "Use --help for usage information" << std::endl;
+        UDT::cleanup();
+#ifdef _WIN32
+        WSACleanup();
+#endif
+        return 1;
+    }
 
     std::string mode = argv[1];
-    if (mode == "send" && argc >= 5) {
+
+    // 检查是否请求帮助
+    if (mode == "--help" || mode == "-h") {
+        std::cerr << "Usage:" << std::endl;
+        std::cerr << "  Send: " << argv[0] <<
+            " send <ip> <port> <filepath> [--mss 1500] [--window 1048576] [--detailed]" << std::endl;
+        std::cerr << "  Receive: " << argv[0] << " recv <port> <save_directory_or_path> [--detailed]" << std::endl;
+        std::cerr << std::endl;
+        std::cerr << "Enhanced Features:" << std::endl;
+        std::cerr << "  - Automatic file name and format transmission" << std::endl;
+        std::cerr << "  - Graceful connection closure with acknowledgment" << std::endl;
+        std::cerr << "  - MIME type detection and transmission" << std::endl;
+        std::cerr << "  - Accurate network statistics based on UDT4 API" << std::endl;
+        std::cerr << "  - Smart file saving (directory or specific path)" << std::endl;
+        std::cerr << "  - MD5 verification for data integrity" << std::endl;
+        std::cerr << std::endl;
+        std::cerr << "Examples:" << std::endl;
+        std::cerr << "  # Send a file with custom parameters" << std::endl;
+        std::cerr << "  " << argv[0] << " send 192.168.1.100 9000 largefile.zip --mss 1460 --window 2097152" << std::endl;
+        std::cerr << "  # Receive to a directory (filename auto-detected)" << std::endl;
+        std::cerr << "  " << argv[0] << " recv 9000 ./downloads/" << std::endl;
+        std::cerr << "  # Receive with specific filename" << std::endl;
+        std::cerr << "  " << argv[0] << " recv 9000 ./downloads/myfile.zip" << std::endl;
+        std::cerr << "  # Enable detailed statistics" << std::endl;
+        std::cerr << "  " << argv[0] << " send 192.168.1.100 9000 file.txt --detailed" << std::endl;
+    }
+    else if (mode == "send" && argc >= 5) {
         UDTConfig config;
         // 解析发送端特有的配置
         for (int i = 5; i < argc; ++i) {
-            if (std::string(argv[i]) == "--mss") config.mss = std::atoi(argv[++i]);
-            else if (std::string(argv[i]) == "--window") config.window_size = std::atoi(argv[++i]);
-            else if (std::string(argv[i]) == "--detailed") detailed_stats = true;
+            if (std::string(argv[i]) == "--mss") {
+                if (i + 1 < argc) {
+                    config.mss = std::atoi(argv[++i]);
+                } else {
+                    std::cerr << "Error: --mss requires a value" << std::endl;
+                    UDT::cleanup();
+#ifdef _WIN32
+                    WSACleanup();
+#endif
+                    return 1;
+                }
+            }
+            else if (std::string(argv[i]) == "--window") {
+                if (i + 1 < argc) {
+                    config.window_size = std::atoi(argv[++i]);
+                } else {
+                    std::cerr << "Error: --window requires a value" << std::endl;
+                    UDT::cleanup();
+#ifdef _WIN32
+                    WSACleanup();
+#endif
+                    return 1;
+                }
+            }
+            else if (std::string(argv[i]) == "--detailed") {
+                detailed_stats = true;
+            }
+            else {
+                std::cerr << "Warning: Unknown option " << argv[i] << std::endl;
+            }
         }
         run_sender(argv[2], std::atoi(argv[3]), argv[4], config);
     }
     else if (mode == "recv" && argc >= 4) {
         // 接收端现在不需要在命令行指定 mss 和 window 了
         for (int i = 4; i < argc; ++i) {
-            if (std::string(argv[i]) == "--detailed") detailed_stats = true;
+            if (std::string(argv[i]) == "--detailed") {
+                detailed_stats = true;
+            } else {
+                std::cerr << "Warning: Unknown option " << argv[i] << std::endl;
+            }
         }
         run_receiver(std::atoi(argv[2]), argv[3]);
     }
     else {
-        std::cerr << "Usage:" << std::endl;
-        std::cerr << "  Send: " << argv[0] <<
-            " send <ip> <port> <filepath> [--mss 1500] [--window 1048576] [--detailed]" << std::endl;
-        std::cerr << "  Receive: " << argv[0] << " recv <port> <savepath> [--detailed]" << std::endl;
-        std::cerr << std::endl;
-        std::cerr << "Enhanced Statistics Features:" << std::endl;
-        std::cerr << "  - Real-time speed monitoring (min/max/average)" << std::endl;
-        std::cerr << "  - Complete packet statistics with analysis" << std::endl;
-        std::cerr << "  - Control packet overhead analysis" << std::endl;
-        std::cerr << "  - Network efficiency and data integrity scoring" << std::endl;
-        std::cerr << "  - Network quality assessment and recommendations" << std::endl;
+        std::cerr << "Error: Invalid arguments" << std::endl;
+        std::cerr << "Use --help for usage information" << std::endl;
     }
 
     UDT::cleanup();
+
+#ifdef _WIN32
+    WSACleanup();
+#endif
+
     return 0;
 }
