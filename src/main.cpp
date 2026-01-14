@@ -773,14 +773,12 @@ void run_sender(const char* ip, int port, const char* filepath, const UDTConfig&
     }
 
     // 设置接收超时（等待接收端完成接收和MD5校验）
-    int timeout = 60000; // 60秒超时，给接收端足够时间处理
-    UDT::setsockopt(client, 0, UDT_RCVTIMEO, &timeout, sizeof(int));
+    // int timeout = 60000; // 60秒超时，给接收端足够时间处理
+    // UDT::setsockopt(client, 0, UDT_RCVTIMEO, &timeout, sizeof(int));
 
     // 等待接收端完成接收并返回MD5校验结果
     TransferCompletePacket tcp;
-    /*while (true) {
 
-    }*/
     int recv_result = UDT::recv(client, (char*)&tcp, sizeof(TransferCompletePacket), 0);
 
     // 记录结束时间
