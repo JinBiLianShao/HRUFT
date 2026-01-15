@@ -76,13 +76,19 @@ if (TARGET_OS STREQUAL "windows")
     add_compile_definitions(UDT_EXPORTS)
     add_compile_definitions(WIN32 UDT_STATIC _CRT_SECURE_NO_WARNINGS)
     add_compile_options(-static -static-libgcc -static-libstdc++)
+    # 允许编译器进行“宽松”的类型转换（解决 -fpermissive 报错）
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fpermissive")
+
+    # 显式定义 WIN32 宏，防止 UDT 误入 POSIX 分支
+    add_definitions(-DWIN32 -D_WIN32 -D_AMD64_)
 
     # 如果在 Linux 下使用 MinGW 交叉编译 Windows
     if (CMAKE_HOST_SYSTEM_NAME MATCHES "Linux")
         set(CMAKE_SYSTEM_NAME Windows)
         add_definitions(-DUDT_STATIC)
-        set(CMAKE_C_COMPILER x86_64-w64-mingw32-gcc)
-        set(CMAKE_CXX_COMPILER x86_64-w64-mingw32-g++)
+        # 在 CMakeLists.txt 中对应的交叉编译逻辑处修改路径
+        set(CMAKE_C_COMPILER "/opt/xpack-mingw-w64-gcc-15.2.0-2/bin/x86_64-w64-mingw32-gcc")
+        set(CMAKE_CXX_COMPILER "/opt/xpack-mingw-w64-gcc-15.2.0-2/bin/x86_64-w64-mingw32-g++")
     endif()
 
 else()
