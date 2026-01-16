@@ -17,6 +17,7 @@
 #include <thread>
 #include <filesystem>
 #include <unistd.h>
+#include <codecvt>
 #include <locale>
 
 #ifdef _WIN32
@@ -45,10 +46,11 @@ struct HandshakePacket {
     char md5[32]; // MD5字符串
     int mss; // 发送端指定的MSS
     int window_size; // 发送端指定的Window Size
-    char filename[256]; // 文件名
+    char filename[512]; // 文件名（扩大缓冲区以支持UTF-8编码的中文）
     char file_extension[16]; // 文件扩展名（格式）
     char mime_type[64]; // MIME类型（可选）
     uint8_t has_mime_type; // 是否有MIME类型
+    uint8_t filename_encoding; // 文件名编码: 0=UTF-8, 1=GBK, 2=GB2312
 };
 #pragma pack(pop)
 
@@ -66,6 +68,93 @@ struct UDTConfig {
     int mss = 1500;
     int window_size = 10485760; // 默认 1MB
 };
+
+// ==========================================
+// 路径转换辅助函数（跨平台）
+// ==========================================
+
+#ifdef _WIN32
+// Windows平台：UTF-8到宽字符转换
+std::wstring utf8_to_wstring(const std::string &utf8_str) {
+    if (utf8_str.empty()) return L"";
+
+    int wsize = MultiByteToWideChar(CP_UTF8, 0, utf8_str.c_str(), (int) utf8_str.size(), NULL, 0);
+    if (wsize == 0) return L"";
+
+    std::wstring wstr(wsize, 0);
+    MultiByteToWideChar(CP_UTF8, 0, utf8_str.c_str(), (int) utf8_str.size(), &wstr[0], wsize);
+    return wstr;
+}
+
+// Windows平台：宽字符到UTF-8转换
+std::string wstring_to_utf8(const std::wstring &wstr) {
+    if (wstr.empty()) return "";
+
+    int utf8_size = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), (int) wstr.size(), NULL, 0, NULL, NULL);
+    if (utf8_size == 0) return "";
+
+    std::string utf8_str(utf8_size, 0);
+    WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), (int) wstr.size(), &utf8_str[0], utf8_size, NULL, NULL);
+    return utf8_str;
+}
+
+// Windows平台：打开UTF-8路径的文件流
+// Windows平台：打开UTF-8路径的文件流
+std::ifstream open_input_file_utf8(const std::string &utf8_path) {
+    std::filesystem::path wpath = std::filesystem::path(utf8_to_wstring(utf8_path));
+    return std::ifstream(wpath, std::ios::binary | std::ios::ate);
+}
+
+std::ofstream open_output_file_utf8(const std::string &utf8_path) {
+    std::filesystem::path wpath = std::filesystem::path(utf8_to_wstring(utf8_path));
+    return std::ofstream(wpath, std::ios::binary);
+}
+
+// 检查文件是否存在（UTF-8路径）
+bool file_exists_utf8(const std::string &utf8_path) {
+    std::wstring wpath = utf8_to_wstring(utf8_path);
+    DWORD attr = GetFileAttributesW(wpath.c_str());
+    return (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY));
+}
+
+// 检查目录是否存在（UTF-8路径）
+bool dir_exists_utf8(const std::string &utf8_path) {
+    std::wstring wpath = utf8_to_wstring(utf8_path);
+    DWORD attr = GetFileAttributesW(wpath.c_str());
+    return (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY));
+}
+
+// 创建目录（UTF-8路径）
+bool create_directories_utf8(const std::string &utf8_path) {
+    std::wstring wpath = utf8_to_wstring(utf8_path);
+    return CreateDirectoryW(wpath.c_str(), NULL) != 0;
+}
+
+#else
+// Linux/macOS平台：直接使用UTF-8路径
+std::ifstream open_input_file_utf8(const std::string &utf8_path) {
+    return std::ifstream(utf8_path.c_str(), std::ios::binary | std::ios::ate);
+}
+
+std::ofstream open_output_file_utf8(const std::string &utf8_path) {
+    return std::ofstream(utf8_path.c_str(), std::ios::binary);
+}
+
+bool file_exists_utf8(const std::string &utf8_path) {
+    struct stat buffer;
+    return (stat(utf8_path.c_str(), &buffer) == 0 && S_ISREG(buffer.st_mode));
+}
+
+bool dir_exists_utf8(const std::string &utf8_path) {
+    struct stat buffer;
+    return (stat(utf8_path.c_str(), &buffer) == 0 && S_ISDIR(buffer.st_mode));
+}
+
+bool create_directories_utf8(const std::string &utf8_path) {
+    std::error_code ec;
+    return std::filesystem::create_directories(utf8_path, ec);
+}
+#endif
 
 // ==========================================
 // 传输统计结构
@@ -568,18 +657,29 @@ void report_progress(long long current, long long total, double speed_mbps,
     }
 }
 
-std::string calculate_file_md5(const std::string &filepath) {
-    std::ifstream file(filepath, std::ios::binary);
+// 使用UTF-8路径计算文件MD5
+std::string calculate_file_md5_utf8(const std::string &utf8_filepath) {
+#ifdef _WIN32
+    // 修改这里：使用 std::filesystem::path 来转换宽字符串路径
+    std::filesystem::path wpath = std::filesystem::path(utf8_to_wstring(utf8_filepath));
+    std::ifstream file(wpath, std::ios::binary);
+#else
+    std::ifstream file(utf8_filepath, std::ios::binary);
+#endif
+
     if (!file) return "";
+
     md5_state_t state;
     md5_byte_t digest[16];
     md5_init(&state);
     const size_t buffer_size = 10 * 1024 * 1024;
     std::vector<char> buffer(buffer_size);
+
     while (file.good()) {
         file.read(buffer.data(), buffer_size);
         if (file.gcount() > 0) md5_append(&state, (const md5_byte_t *) buffer.data(), (int) file.gcount());
     }
+
     md5_finish(&state, digest);
     std::stringstream ss;
     for (int i = 0; i < 16; ++i) ss << std::hex << std::setw(2) << std::setfill('0') << (int) digest[i];
@@ -604,17 +704,66 @@ void apply_socket_opts(UDTSOCKET sock, int mss, int win_size) {
     // UDT::setsockopt(sock, 0, UDT_RCVSYN, &block, sizeof(block));
 }
 
-// 确保目录存在
-bool ensure_directory_exists(const std::string &dir_path) {
+// 确保目录存在（使用UTF-8路径）
+bool ensure_directory_exists_utf8(const std::string &utf8_dir_path) {
+#ifdef _WIN32
+    std::wstring wpath = utf8_to_wstring(utf8_dir_path);
+    if (wpath.empty()) return false;
+
+    // 逐级创建目录
+    size_t pos = 0;
+    do {
+        pos = wpath.find_first_of(L"\\/", pos + 1);
+        std::wstring subpath = wpath.substr(0, pos);
+
+        if (subpath.length() > 2 && subpath[1] == L':') {
+            // 跳过盘符
+            continue;
+        }
+
+        DWORD attr = GetFileAttributesW(subpath.c_str());
+        if (attr == INVALID_FILE_ATTRIBUTES) {
+            if (!CreateDirectoryW(subpath.c_str(), NULL)) {
+                DWORD err = GetLastError();
+                if (err != ERROR_ALREADY_EXISTS) {
+                    report_json("error", "message", "Failed to create directory: error " + std::to_string(err));
+                    return false;
+                }
+            }
+        }
+    } while (pos != std::wstring::npos);
+
+    return true;
+#else
     try {
-        if (!std::filesystem::exists(dir_path)) {
-            return std::filesystem::create_directories(dir_path);
+        if (!std::filesystem::exists(utf8_dir_path)) {
+            return std::filesystem::create_directories(utf8_dir_path);
         }
         return true;
     } catch (const std::exception &e) {
         report_json("error", "message", "Failed to create directory: " + std::string(e.what()));
         return false;
     }
+#endif
+}
+
+// 获取文件大小（使用UTF-8路径）
+long long get_file_size_utf8(const std::string &utf8_filepath) {
+#ifdef _WIN32
+    std::wstring wpath = utf8_to_wstring(utf8_filepath);
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (GetFileAttributesExW(wpath.c_str(), GetFileExInfoStandard, &fad)) {
+        LARGE_INTEGER size;
+        size.HighPart = fad.nFileSizeHigh;
+        size.LowPart = fad.nFileSizeLow;
+        return size.QuadPart;
+    }
+    return -1;
+#else
+    struct stat stat_buf;
+    int rc = stat(utf8_filepath.c_str(), &stat_buf);
+    return rc == 0 ? stat_buf.st_size : -1;
+#endif
 }
 
 // ==========================================
@@ -622,10 +771,30 @@ bool ensure_directory_exists(const std::string &dir_path) {
 // ==========================================
 
 void run_sender(const char *ip, int port, const char *filepath, const UDTConfig &config) {
+    // 将文件路径转换为UTF-8（如果命令行参数是GBK编码）
+    std::string utf8_filepath;
+#ifdef _WIN32
+    // Windows命令行参数通常是本地编码（GBK），需要转换为UTF-8
+    int wsize = MultiByteToWideChar(CP_ACP, 0, filepath, -1, NULL, 0);
+    if (wsize > 0) {
+        std::wstring wstr(wsize, 0);
+        MultiByteToWideChar(CP_ACP, 0, filepath, -1, &wstr[0], wsize);
+        // 移除末尾的null字符
+        if (!wstr.empty() && wstr.back() == L'\0') {
+            wstr.pop_back();
+        }
+        utf8_filepath = wstring_to_utf8(wstr);
+    } else {
+        utf8_filepath = filepath; // 如果转换失败，使用原始路径
+    }
+#else
+    utf8_filepath = filepath; // Linux/macOS直接使用UTF-8
+#endif
+
     report_json("status", "message", "Calculating MD5...");
-    std::string local_md5 = calculate_file_md5(filepath);
+    std::string local_md5 = calculate_file_md5_utf8(utf8_filepath);
     if (local_md5.empty()) {
-        report_json("error", "message", "File error or not found");
+        report_json("error", "message", "File error or not found: " + utf8_filepath);
         return;
     }
 
@@ -654,9 +823,10 @@ void run_sender(const char *ip, int port, const char *filepath, const UDTConfig 
         return;
     }
 
-    std::ifstream ifs(filepath, std::ios::binary | std::ios::ate);
+    // 使用UTF-8路径打开文件
+    auto ifs = open_input_file_utf8(utf8_filepath);
     if (!ifs) {
-        report_json("error", "message", "Cannot open file for reading");
+        report_json("error", "message", "Cannot open file for reading: " + utf8_filepath);
         UDT::close(client);
         return;
     }
@@ -664,15 +834,24 @@ void run_sender(const char *ip, int port, const char *filepath, const UDTConfig 
     long long f_size = ifs.tellg();
     ifs.seekg(0, std::ios::beg);
 
-    // 提取文件信息
-    std::filesystem::path file_path(filepath);
-    std::string filename = file_path.filename().string();
-    std::string extension = file_path.extension().string();
+    // 提取文件信息（使用UTF-8）
+    std::string filename;
+    std::string extension;
+
+#ifdef _WIN32
+    std::wstring wpath = utf8_to_wstring(utf8_filepath);
+    std::filesystem::path file_path(wpath);
+#else
+    std::filesystem::path file_path(utf8_filepath);
+#endif
+
+    filename = file_path.filename().string(); // 保持UTF-8编码
+    extension = file_path.extension().string();
     std::string mime_type = get_mime_type_from_extension(extension);
 
     // 确保不会溢出
-    if (filename.length() >= 256) {
-        filename = filename.substr(0, 255);
+    if (filename.length() >= 512) {
+        filename = filename.substr(0, 511);
     }
     if (extension.length() >= 16) {
         extension = extension.substr(0, 15);
@@ -705,11 +884,12 @@ void run_sender(const char *ip, int port, const char *filepath, const UDTConfig 
     memset(hp.file_extension, 0, sizeof(hp.file_extension));
     memset(hp.mime_type, 0, sizeof(hp.mime_type));
 
-    // 复制文件信息
+    // 复制文件信息（UTF-8编码）
     strncpy(hp.filename, filename.c_str(), sizeof(hp.filename) - 1);
     strncpy(hp.file_extension, extension.c_str(), sizeof(hp.file_extension) - 1);
     strncpy(hp.mime_type, mime_type.c_str(), sizeof(hp.mime_type) - 1);
     hp.has_mime_type = !mime_type.empty() ? 1 : 0;
+    hp.filename_encoding = 0; // UTF-8编码
 
     if (UDT::ERROR == UDT::send(client, (char *) &hp, sizeof(HandshakePacket), 0)) {
         report_json("error", "message", "Failed to send handshake packet");
@@ -726,10 +906,6 @@ void run_sender(const char *ip, int port, const char *filepath, const UDTConfig 
 
     // 记录开始传输时间
     stats.start_time = std::chrono::steady_clock::now();
-
-    // bool block = false;
-    // UDT::setsockopt(client, 0, UDT_SNDSYN, &block, sizeof(block));
-    // UDT::setsockopt(client, 0, UDT_RCVSYN, &block, sizeof(block));
 
     while (total_sent < f_size) {
         ifs.read(buffer.data(), buffer.size());
@@ -779,9 +955,6 @@ void run_sender(const char *ip, int port, const char *filepath, const UDTConfig 
 
     // 文件数据发送完成
     report_json("status", "message", "File data transmission complete, sending EOF marker...");
-    // block = true;
-    // UDT::setsockopt(client, 0, UDT_SNDSYN, &block, sizeof(block));
-    // UDT::setsockopt(client, 0, UDT_RCVSYN, &block, sizeof(block));
 
     // 发送文件传输结束标记
     const char *eof_marker = "FILE_TRANSMISSION_COMPLETE_EOF";
@@ -790,10 +963,6 @@ void run_sender(const char *ip, int port, const char *filepath, const UDTConfig 
     } else {
         report_json("status", "message", "EOF marker sent, waiting for receiver to finish...");
     }
-
-    // 设置接收超时（等待接收端完成接收和MD5校验）
-    // int timeout = 60000; // 60秒超时，给接收端足够时间处理
-    // UDT::setsockopt(client, 0, UDT_RCVTIMEO, &timeout, sizeof(int));
 
     // 等待接收端完成接收并返回MD5校验结果
     TransferCompletePacket tcp;
@@ -904,6 +1073,26 @@ void run_sender(const char *ip, int port, const char *filepath, const UDTConfig 
 // ==========================================
 
 void run_receiver(int port, const char *save_path) {
+    // 将保存路径转换为UTF-8
+    std::string utf8_save_path;
+#ifdef _WIN32
+    // Windows命令行参数通常是本地编码（GBK），需要转换为UTF-8
+    int wsize = MultiByteToWideChar(CP_ACP, 0, save_path, -1, NULL, 0);
+    if (wsize > 0) {
+        std::wstring wstr(wsize, 0);
+        MultiByteToWideChar(CP_ACP, 0, save_path, -1, &wstr[0], wsize);
+        // 移除末尾的null字符
+        if (!wstr.empty() && wstr.back() == L'\0') {
+            wstr.pop_back();
+        }
+        utf8_save_path = wstring_to_utf8(wstr);
+    } else {
+        utf8_save_path = save_path; // 如果转换失败，使用原始路径
+    }
+#else
+    utf8_save_path = save_path; // Linux/macOS直接使用UTF-8
+#endif
+
     UDTSOCKET serv = UDT::socket(AF_INET, SOCK_STREAM, 0);
     if (serv == UDT::INVALID_SOCK) {
         report_json("error", "message", "Failed to create UDT server socket");
@@ -966,26 +1155,30 @@ void run_receiver(int port, const char *save_path) {
                                 : "";
 
     // 构建保存路径
-    std::filesystem::path save_path_obj(save_path);
     std::string final_save_path;
 
     // 检查用户指定的是目录还是文件路径
     bool is_directory = false;
-    try {
-        if (std::filesystem::exists(save_path_obj)) {
-            is_directory = std::filesystem::is_directory(save_path_obj);
-        } else {
-            // 如果路径不存在，检查是否有扩展名来判断
-            is_directory = save_path_obj.extension().empty();
-        }
-    } catch (...) {
-        // 默认按目录处理
+
+    // 检查路径是否存在且是目录
+    if (dir_exists_utf8(utf8_save_path)) {
         is_directory = true;
+    } else if (file_exists_utf8(utf8_save_path)) {
+        is_directory = false; // 是文件
+    } else {
+        // 路径不存在，检查是否有扩展名来判断
+#ifdef _WIN32
+        std::wstring wpath = utf8_to_wstring(utf8_save_path);
+        std::filesystem::path path_obj(wpath);
+#else
+        std::filesystem::path path_obj(utf8_save_path);
+#endif
+        is_directory = path_obj.extension().empty();
     }
 
     if (is_directory) {
         // 用户指定的是目录
-        if (!ensure_directory_exists(save_path)) {
+        if (!ensure_directory_exists_utf8(utf8_save_path)) {
             UDT::close(recver);
             UDT::close(serv);
             return;
@@ -997,33 +1190,94 @@ void run_receiver(int port, const char *save_path) {
             received_filename = "received_file_" + std::to_string(now);
         }
 
+        // 构建完整路径
+#ifdef _WIN32
+        std::wstring w_save_path = utf8_to_wstring(utf8_save_path);
+        std::wstring w_filename;
+
+        // 根据编码转换文件名
+        if (hp.filename_encoding == 0) {
+            // UTF-8编码
+            w_filename = utf8_to_wstring(received_filename);
+        } else {
+            // 其他编码（如GBK），在Windows上可能需要特殊处理
+            // 这里假设文件名已经是当前系统编码
+            int wsize = MultiByteToWideChar(CP_ACP, 0, received_filename.c_str(), -1, NULL, 0);
+            if (wsize > 0) {
+                w_filename.resize(wsize);
+                MultiByteToWideChar(CP_ACP, 0, received_filename.c_str(), -1, &w_filename[0], wsize);
+                if (!w_filename.empty() && w_filename.back() == L'\0') {
+                    w_filename.pop_back();
+                }
+            } else {
+                w_filename = L"received_file";
+            }
+        }
+
+        // 如果有扩展名但文件名中没有，添加扩展名
+        if (!received_extension.empty()) {
+            std::wstring w_extension = utf8_to_wstring(received_extension);
+            std::filesystem::path filename_path(w_filename);
+            if (filename_path.extension().empty()) {
+                w_filename += w_extension;
+            }
+        }
+
+        std::filesystem::path final_path = std::filesystem::path(w_save_path) / std::filesystem::path(w_filename);
+        final_save_path = wstring_to_utf8(final_path.wstring());
+#else
+        // Linux/macOS：直接使用UTF-8
+        std::filesystem::path final_path = std::filesystem::path(utf8_save_path) / std::filesystem::path(
+                                               received_filename);
+
         // 如果有扩展名但文件名中没有，添加扩展名
         if (!received_extension.empty()) {
             std::filesystem::path filename_path(received_filename);
             if (filename_path.extension().empty()) {
-                received_filename += received_extension;
+                final_path.replace_extension(received_extension);
             }
         }
 
-        save_path_obj /= received_filename;
-        final_save_path = save_path_obj.string();
+        final_save_path = final_path.string();
+#endif
     } else {
         // 用户指定的是具体文件路径
-        final_save_path = save_path;
+        final_save_path = utf8_save_path;
 
         // 如果没有扩展名而我们有，添加扩展名
-        if (!received_extension.empty() && save_path_obj.extension().empty()) {
-            save_path_obj.replace_extension(received_extension);
-            final_save_path = save_path_obj.string();
+        if (!received_extension.empty()) {
+#ifdef _WIN32
+            std::wstring w_path = utf8_to_wstring(final_save_path);
+            std::filesystem::path path_obj(w_path);
+            if (path_obj.extension().empty()) {
+                std::wstring w_extension = utf8_to_wstring(received_extension);
+                path_obj.replace_extension(w_extension);
+                final_save_path = wstring_to_utf8(path_obj.wstring());
+            }
+#else
+            std::filesystem::path path_obj(final_save_path);
+            if (path_obj.extension().empty()) {
+                path_obj.replace_extension(received_extension);
+                final_save_path = path_obj.string();
+            }
+#endif
         }
     }
 
     // 确保目录存在（如果是嵌套目录）
     try {
+#ifdef _WIN32
+        std::wstring w_final_path = utf8_to_wstring(final_save_path);
+        std::filesystem::path parent_dir = std::filesystem::path(w_final_path).parent_path();
+        if (!parent_dir.empty()) {
+            ensure_directory_exists_utf8(wstring_to_utf8(parent_dir.wstring()));
+        }
+#else
         std::filesystem::path parent_dir = std::filesystem::path(final_save_path).parent_path();
         if (!parent_dir.empty()) {
-            ensure_directory_exists(parent_dir.string());
+            ensure_directory_exists_utf8(parent_dir.string());
         }
+#endif
     } catch (...) {
         // 忽略目录创建错误，让文件创建失败时再报错
     }
@@ -1044,7 +1298,7 @@ void run_receiver(int port, const char *save_path) {
     stats.start_time = std::chrono::steady_clock::now();
 
     // 4. 接收文件数据
-    std::ofstream ofs(final_save_path, std::ios::binary);
+    auto ofs = open_output_file_utf8(final_save_path);
     if (!ofs) {
         report_json("error", "message", "Cannot create file: " + final_save_path);
         UDT::close(recver);
@@ -1057,10 +1311,6 @@ void run_receiver(int port, const char *save_path) {
     auto last_time = std::chrono::steady_clock::now();
     long long last_bytes = 0;
     bool received_eof_marker = false;
-
-    // bool block = false;
-    // UDT::setsockopt(recver, 0, UDT_SNDSYN, &block, sizeof(block));
-    // UDT::setsockopt(recver, 0, UDT_RCVSYN, &block, sizeof(block));
 
     // 持续接收直到收到EOF标记
     while (!received_eof_marker && total_recv < hp.file_size) {
@@ -1135,10 +1385,6 @@ void run_receiver(int port, const char *save_path) {
 
     ofs.close();
 
-    // block = true;
-    // UDT::setsockopt(recver, 0, UDT_SNDSYN, &block, sizeof(block));
-    // UDT::setsockopt(recver, 0, UDT_RCVSYN, &block, sizeof(block));
-
     // 检查文件完整性并计算MD5
     bool transfer_complete = false;
     std::string actual_md5;
@@ -1147,7 +1393,7 @@ void run_receiver(int port, const char *save_path) {
         report_json("status", "message", "File received completely, verifying MD5...");
 
         // 计算MD5
-        actual_md5 = calculate_file_md5(final_save_path);
+        actual_md5 = calculate_file_md5_utf8(final_save_path);
         std::string expected_md5(hp.md5, 32);
 
         bool md5_match = (actual_md5 == expected_md5);
@@ -1214,10 +1460,13 @@ void run_receiver(int port, const char *save_path) {
 
         // 删除不完整的文件
         try {
-            if (std::filesystem::exists(final_save_path)) {
-                std::filesystem::remove(final_save_path);
-                report_json("status", "message", "Deleted incomplete file: " + final_save_path);
-            }
+#ifdef _WIN32
+            std::filesystem::path wpath = std::filesystem::path(utf8_to_wstring(final_save_path));
+            std::filesystem::remove(wpath);
+#else
+            std::remove(final_save_path.c_str());
+#endif
+            report_json("status", "message", "Deleted incomplete file: " + final_save_path);
         } catch (...) {
             // 忽略删除错误
         }
@@ -1277,6 +1526,11 @@ int main(int argc, char *argv[]) {
 #ifdef _WIN32
     // 强制设置控制台输出代码页为 UTF-8 (65001)
     SetConsoleOutputCP(CP_UTF8);
+    // 设置控制台输入代码页为 UTF-8
+    SetConsoleCP(CP_UTF8);
+
+    // 设置本地化以支持中文
+    setlocale(LC_ALL, "zh-CN.UTF-8");
 
     // 初始化Winsock
     WSADATA wsaData;
@@ -1285,15 +1539,32 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 #endif
-    std::locale::global(std::locale("zh-CN"));
+
+    // 设置全局locale为UTF-8
+    try {
+        std::locale::global(std::locale("en_US.UTF-8"));
+    } catch (...) {
+        try {
+            std::locale::global(std::locale("zh_CN.UTF-8"));
+        } catch (...) {
+            // 如果设置失败，使用默认locale
+        }
+    }
+
+    // 确保cout使用UTF-8
+    std::ios_base::sync_with_stdio(false);
+    std::locale utf8_locale(std::locale(), new std::codecvt_utf8<wchar_t>);
+    std::wcout.imbue(utf8_locale);
+    std::wcin.imbue(utf8_locale);
+
     // 添加命令行参数解析
     bool detailed_stats = false;
 
     UDT::startup();
 
     if (argc < 2) {
-        std::cerr << "Error: No arguments provided" << std::endl;
-        std::cerr << "Use --help for usage information" << std::endl;
+        std::cerr << "错误: 没有提供参数" << std::endl;
+        std::cerr << "使用 --help 查看使用信息" << std::endl;
         UDT::cleanup();
 #ifdef _WIN32
         WSACleanup();
@@ -1305,29 +1576,29 @@ int main(int argc, char *argv[]) {
 
     // 检查是否请求帮助
     if (mode == "--help" || mode == "-h") {
-        std::cerr << "Usage:" << std::endl;
-        std::cerr << "  Send: " << argv[0] <<
-                " send <ip> <port> <filepath> [--mss 1500] [--window 1048576] [--detailed]" << std::endl;
-        std::cerr << "  Receive: " << argv[0] << " recv <port> <save_directory_or_path> [--detailed]" << std::endl;
+        std::cerr << "使用方法:" << std::endl;
+        std::cerr << "  发送: " << argv[0] <<
+                " send <ip> <port> <文件路径> [--mss 1500] [--window 1048576] [--detailed]" << std::endl;
+        std::cerr << "  接收: " << argv[0] << " recv <port> <保存目录或路径> [--detailed]" << std::endl;
         std::cerr << std::endl;
-        std::cerr << "Enhanced Features:" << std::endl;
-        std::cerr << "  - Automatic file name and format transmission" << std::endl;
-        std::cerr << "  - Graceful connection closure with acknowledgment" << std::endl;
-        std::cerr << "  - MIME type detection and transmission" << std::endl;
-        std::cerr << "  - Accurate network statistics based on UDT4 API" << std::endl;
-        std::cerr << "  - Smart file saving (directory or specific path)" << std::endl;
-        std::cerr << "  - MD5 verification for data integrity" << std::endl;
+        std::cerr << "增强功能:" << std::endl;
+        std::cerr << "  - 支持中文路径和文件名" << std::endl;
+        std::cerr << "  - 自动传输文件名和格式" << std::endl;
+        std::cerr << "  - 优雅的连接关闭和确认" << std::endl;
+        std::cerr << "  - MIME类型检测和传输" << std::endl;
+        std::cerr << "  - 基于UDT4 API的准确网络统计" << std::endl;
+        std::cerr << "  - 智能文件保存（目录或具体路径）" << std::endl;
+        std::cerr << "  - MD5校验确保数据完整性" << std::endl;
         std::cerr << std::endl;
-        std::cerr << "Examples:" << std::endl;
-        std::cerr << "  # Send a file with custom parameters" << std::endl;
-        std::cerr << "  " << argv[0] << " send 192.168.1.100 9000 largefile.zip --mss 1460 --window 2097152" <<
-                std::endl;
-        std::cerr << "  # Receive to a directory (filename auto-detected)" << std::endl;
-        std::cerr << "  " << argv[0] << " recv 9000 ./downloads/" << std::endl;
-        std::cerr << "  # Receive with specific filename" << std::endl;
-        std::cerr << "  " << argv[0] << " recv 9000 ./downloads/myfile.zip" << std::endl;
-        std::cerr << "  # Enable detailed statistics" << std::endl;
-        std::cerr << "  " << argv[0] << " send 192.168.1.100 9000 file.txt --detailed" << std::endl;
+        std::cerr << "示例:" << std::endl;
+        std::cerr << "  # 使用自定义参数发送文件" << std::endl;
+        std::cerr << "  " << argv[0] << " send 192.168.1.100 9000 大型文件.zip --mss 1460 --window 2097152" << std::endl;
+        std::cerr << "  # 接收文件到目录（文件名自动检测）" << std::endl;
+        std::cerr << "  " << argv[0] << " recv 9000 ./下载目录/" << std::endl;
+        std::cerr << "  # 使用具体文件名接收" << std::endl;
+        std::cerr << "  " << argv[0] << " recv 9000 ./下载目录/我的文件.zip" << std::endl;
+        std::cerr << "  # 启用详细统计" << std::endl;
+        std::cerr << "  " << argv[0] << " send 192.168.1.100 9000 文件.txt --detailed" << std::endl;
     } else if (mode == "send" && argc >= 5) {
         UDTConfig config;
         // 解析发送端特有的配置
@@ -1336,7 +1607,7 @@ int main(int argc, char *argv[]) {
                 if (i + 1 < argc) {
                     config.mss = std::atoi(argv[++i]);
                 } else {
-                    std::cerr << "Error: --mss requires a value" << std::endl;
+                    std::cerr << "错误: --mss 需要参数值" << std::endl;
                     UDT::cleanup();
 #ifdef _WIN32
                     WSACleanup();
@@ -1347,7 +1618,7 @@ int main(int argc, char *argv[]) {
                 if (i + 1 < argc) {
                     config.window_size = std::atoi(argv[++i]);
                 } else {
-                    std::cerr << "Error: --window requires a value" << std::endl;
+                    std::cerr << "错误: --window 需要参数值" << std::endl;
                     UDT::cleanup();
 #ifdef _WIN32
                     WSACleanup();
@@ -1357,7 +1628,7 @@ int main(int argc, char *argv[]) {
             } else if (std::string(argv[i]) == "--detailed") {
                 detailed_stats = true;
             } else {
-                std::cerr << "Warning: Unknown option " << argv[i] << std::endl;
+                std::cerr << "警告: 未知选项 " << argv[i] << std::endl;
             }
         }
         run_sender(argv[2], std::atoi(argv[3]), argv[4], config);
@@ -1367,13 +1638,13 @@ int main(int argc, char *argv[]) {
             if (std::string(argv[i]) == "--detailed") {
                 detailed_stats = true;
             } else {
-                std::cerr << "Warning: Unknown option " << argv[i] << std::endl;
+                std::cerr << "警告: 未知选项 " << argv[i] << std::endl;
             }
         }
         run_receiver(std::atoi(argv[2]), argv[3]);
     } else {
-        std::cerr << "Error: Invalid arguments" << std::endl;
-        std::cerr << "Use --help for usage information" << std::endl;
+        std::cerr << "错误: 无效参数" << std::endl;
+        std::cerr << "使用 --help 查看使用信息" << std::endl;
     }
 
     UDT::cleanup();
