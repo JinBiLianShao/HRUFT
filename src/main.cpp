@@ -17,6 +17,7 @@
 #include <thread>
 #include <filesystem>
 #include <unistd.h>
+#include <locale>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -1275,7 +1276,7 @@ void run_receiver(int port, const char *save_path) {
 int main(int argc, char *argv[]) {
 #ifdef _WIN32
     // 强制设置控制台输出代码页为 UTF-8 (65001)
-    SetConsoleOutputCP(65001);
+    SetConsoleOutputCP(CP_UTF8);
 
     // 初始化Winsock
     WSADATA wsaData;
@@ -1284,7 +1285,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 #endif
-
+    std::locale::global(std::locale("zh-CN"));
     // 添加命令行参数解析
     bool detailed_stats = false;
 
