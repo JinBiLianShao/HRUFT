@@ -43,7 +43,7 @@
 #pragma pack(push, 1)
 struct HandshakePacket {
     long long file_size; // 文件总大小
-    char md5[32]; // MD5字符串
+    char md5[32]; // MD5字符串（流式优化后填0）
     int mss; // 发送端指定的MSS
     int window_size; // 发送端指定的Window Size
     char filename[512]; // 文件名（扩大缓冲区以支持UTF-8编码的中文）
@@ -61,6 +61,14 @@ struct TransferCompletePacket {
     char md5[32]; // 接收端计算的MD5
     int64_t received_bytes; // 接收端实际接收的字节数
     int64_t missing_count; // 缺失的包数量(如果有)
+};
+#pragma pack(pop)
+
+// 新增：文件传输结束包，包含发送端边传边算的MD5
+#pragma pack(push, 1)
+struct FileFooterPacket {
+    char marker[32]; // 固定标记 "FILE_TRANSFER_END"
+    char md5[32];    // 发送端计算出的最终MD5
 };
 #pragma pack(pop)
 
@@ -98,7 +106,6 @@ std::string wstring_to_utf8(const std::wstring &wstr) {
     return utf8_str;
 }
 
-// Windows平台：打开UTF-8路径的文件流
 // Windows平台：打开UTF-8路径的文件流
 std::ifstream open_input_file_utf8(const std::string &utf8_path) {
     std::filesystem::path wpath = std::filesystem::path(utf8_to_wstring(utf8_path));
@@ -657,10 +664,9 @@ void report_progress(long long current, long long total, double speed_mbps,
     }
 }
 
-// 使用UTF-8路径计算文件MD5
+// 使用UTF-8路径计算文件MD5（保留用于其他用途，流式优化后不再用于传输中）
 std::string calculate_file_md5_utf8(const std::string &utf8_filepath) {
 #ifdef _WIN32
-    // 修改这里：使用 std::filesystem::path 来转换宽字符串路径
     std::filesystem::path wpath = std::filesystem::path(utf8_to_wstring(utf8_filepath));
     std::ifstream file(wpath, std::ios::binary);
 #else
@@ -767,7 +773,7 @@ long long get_file_size_utf8(const std::string &utf8_filepath) {
 }
 
 // ==========================================
-// 发送端逻辑
+// 发送端逻辑（已优化为流式计算MD5）
 // ==========================================
 
 void run_sender(const char *ip, int port, const char *filepath, const UDTConfig &config) {
@@ -791,12 +797,8 @@ void run_sender(const char *ip, int port, const char *filepath, const UDTConfig 
     utf8_filepath = filepath; // Linux/macOS直接使用UTF-8
 #endif
 
-    report_json("status", "message", "Calculating MD5...");
-    std::string local_md5 = calculate_file_md5_utf8(utf8_filepath);
-    if (local_md5.empty()) {
-        report_json("error", "message", "File error or not found: " + utf8_filepath);
-        return;
-    }
+    // 【流式优化】删除预先计算MD5，改为流式计算
+    report_json("status", "message", "Starting file transmission with streaming MD5...");
 
     UDTSOCKET client = UDT::socket(AF_INET, SOCK_STREAM, 0);
     if (client == UDT::INVALID_SOCK) {
@@ -833,6 +835,11 @@ void run_sender(const char *ip, int port, const char *filepath, const UDTConfig 
 
     long long f_size = ifs.tellg();
     ifs.seekg(0, std::ios::beg);
+
+    // 【流式优化】初始化流式MD5
+    md5_state_t md5_state;
+    md5_byte_t md5_digest[16];
+    md5_init(&md5_state);
 
     // 提取文件信息（使用UTF-8）
     std::string filename;
@@ -877,7 +884,9 @@ void run_sender(const char *ip, int port, const char *filepath, const UDTConfig 
     hp.file_size = f_size;
     hp.mss = config.mss;
     hp.window_size = config.window_size;
-    memcpy(hp.md5, local_md5.c_str(), 32);
+
+    // 【流式优化】握手包中不再发送真实MD5，填0即可
+    memset(hp.md5, 0, 32);
 
     // 清空字符串字段
     memset(hp.filename, 0, sizeof(hp.filename));
@@ -898,7 +907,7 @@ void run_sender(const char *ip, int port, const char *filepath, const UDTConfig 
     }
     stats.transferred_bytes += sizeof(HandshakePacket);
 
-    // 2. 开始传输数据
+    // 2. 开始传输数据（边读边算MD5）
     std::vector<char> buffer(1024 * 1024 * 8);
     long long total_sent = 0;
     auto last_time = std::chrono::steady_clock::now();
@@ -911,6 +920,9 @@ void run_sender(const char *ip, int port, const char *filepath, const UDTConfig 
         ifs.read(buffer.data(), buffer.size());
         int read_len = (int) ifs.gcount();
         if (read_len <= 0) break;
+
+        // 【流式优化】在发送的同时计算MD5
+        md5_append(&md5_state, (const md5_byte_t *)buffer.data(), read_len);
 
         int offset = 0;
         while (offset < read_len) {
@@ -953,15 +965,25 @@ void run_sender(const char *ip, int port, const char *filepath, const UDTConfig 
         return;
     }
 
-    // 文件数据发送完成
-    report_json("status", "message", "File data transmission complete, sending EOF marker...");
+    // 【流式优化】计算最终MD5
+    md5_finish(&md5_state, md5_digest);
 
-    // 发送文件传输结束标记
-    const char *eof_marker = "FILE_TRANSMISSION_COMPLETE_EOF";
-    if (UDT::ERROR == UDT::send(client, eof_marker, strlen(eof_marker) + 1, 0)) {
-        report_json("warning", "message", "Failed to send EOF marker");
+    std::stringstream md5_ss;
+    for (int i = 0; i < 16; ++i) md5_ss << std::hex << std::setw(2) << std::setfill('0') << (int) md5_digest[i];
+    std::string final_md5_str = md5_ss.str();
+
+    report_json("status", "message", "File data sent. MD5 calculated: " + final_md5_str);
+
+    // 【流式优化】发送结构化的结束包，而不是原来的字符串EOF
+    FileFooterPacket footer;
+    memset(&footer, 0, sizeof(footer));
+    strcpy(footer.marker, "FILE_TRANSFER_END");
+    memcpy(footer.md5, final_md5_str.c_str(), 32);
+
+    if (UDT::ERROR == UDT::send(client, (char*)&footer, sizeof(footer), 0)) {
+        report_json("warning", "message", "Failed to send file footer packet");
     } else {
-        report_json("status", "message", "EOF marker sent, waiting for receiver to finish...");
+        report_json("status", "message", "File footer sent, waiting for receiver to finish...");
     }
 
     // 等待接收端完成接收并返回MD5校验结果
@@ -985,7 +1007,7 @@ void run_sender(const char *ip, int port, const char *filepath, const UDTConfig 
             report_json("success", "message", result_info.str());
 
             // 比较MD5
-            std::string expected_md5(local_md5);
+            std::string expected_md5(final_md5_str); // 【修改】使用流式计算的MD5
             std::string actual_md5(tcp.md5, 32);
 
             std::cout << "{\"type\":\"verify\", \"success\":true"
@@ -995,12 +1017,12 @@ void run_sender(const char *ip, int port, const char *filepath, const UDTConfig 
                     << ", \"bytes_received\":" << tcp.received_bytes
                     << "}" << std::endl;
         } else if (tcp.status == 2) {
-            result_info << "FAILED! Expected: " << local_md5
+            result_info << "FAILED! Expected: " << final_md5_str
                     << ", Got: " << std::string(tcp.md5, 32);
             report_json("error", "message", result_info.str());
 
             std::cout << "{\"type\":\"verify\", \"success\":false"
-                    << ", \"expected\":\"" << local_md5
+                    << ", \"expected\":\"" << final_md5_str
                     << "\", \"actual\":\"" << std::string(tcp.md5, 32)
                     << "\", \"bytes_sent\":" << total_sent
                     << ", \"bytes_received\":" << tcp.received_bytes
@@ -1069,7 +1091,7 @@ void run_sender(const char *ip, int port, const char *filepath, const UDTConfig 
 }
 
 // ==========================================
-// 接收端逻辑
+// 接收端逻辑（已优化为流式计算MD5）
 // ==========================================
 
 void run_receiver(int port, const char *save_path) {
@@ -1291,6 +1313,11 @@ void run_receiver(int port, const char *save_path) {
     info << " -> " << final_save_path;
     report_json("status", "message", info.str());
 
+    // 【流式优化】初始化流式MD5
+    md5_state_t md5_state;
+    md5_byte_t md5_digest[16];
+    md5_init(&md5_state);
+
     // 3. 初始化传输统计
     TransferStatistics stats;
     stats.init(hp.file_size, false); // 设置为接收端
@@ -1310,10 +1337,14 @@ void run_receiver(int port, const char *save_path) {
     std::vector<char> buffer(1024 * 1024 * 8);
     auto last_time = std::chrono::steady_clock::now();
     long long last_bytes = 0;
-    bool received_eof_marker = false;
 
-    // 持续接收直到收到EOF标记
-    while (!received_eof_marker && total_recv < hp.file_size) {
+    // 【流式优化】替换原来的字符串EOF检测
+    bool received_footer = false;
+    std::string sender_md5_str; // 存储发送端发来的MD5
+    bool expecting_footer = false;
+
+    // 持续接收直到收到Footer包
+    while (!received_footer && total_recv < hp.file_size) {
         int rs = UDT::recv(recver, buffer.data(), (int) buffer.size(), 0);
         if (rs <= 0) {
             if (rs == UDT::ERROR) {
@@ -1323,38 +1354,64 @@ void run_receiver(int port, const char *save_path) {
             break;
         }
 
-        // 检查是否收到EOF标记
-        std::string received_data(buffer.data(), rs);
-        if (received_data.find("FILE_TRANSMISSION_COMPLETE_EOF") != std::string::npos) {
-            report_json("status", "message", "Received EOF marker from sender.");
-            received_eof_marker = true;
-
-            // 写入EOF标记之前的数据
-            size_t eof_pos = received_data.find("FILE_TRANSMISSION_COMPLETE_EOF");
-            if (eof_pos > 0) {
-                ofs.write(buffer.data(), eof_pos);
-                total_recv += eof_pos;
-                stats.update_speed(eof_pos);
+        // 【流式优化】检查是否是Footer包
+        // 注意：这里需要处理粘包问题
+        if (expecting_footer) {
+            // 如果已经接收完文件数据，期望收到Footer包
+            if (rs >= sizeof(FileFooterPacket)) {
+                FileFooterPacket* footer = (FileFooterPacket*)buffer.data();
+                if (strncmp(footer->marker, "FILE_TRANSFER_END", 17) == 0) {
+                    sender_md5_str = std::string(footer->md5, 32);
+                    received_footer = true;
+                    report_json("status", "message", "Received FileFooterPacket from sender.");
+                    break;
+                }
             }
-            break;
+        } else {
+            // 正常接收文件数据
+            long long remaining_file_data = hp.file_size - total_recv;
+
+            if (rs <= remaining_file_data) {
+                // 整个包都是文件数据
+                md5_append(&md5_state, (const md5_byte_t*)buffer.data(), rs);
+                ofs.write(buffer.data(), rs);
+                total_recv += rs;
+
+                // 更新统计
+                stats.update_speed(rs);
+            } else {
+                // 这个包包含了文件数据的最后一部分和可能的Footer包
+                // 首先，取出文件数据的最后一部分
+                int file_data_len = (int)remaining_file_data;
+                if (file_data_len > 0) {
+                    md5_append(&md5_state, (const md5_byte_t*)buffer.data(), file_data_len);
+                    ofs.write(buffer.data(), file_data_len);
+                    total_recv += file_data_len;
+                    stats.update_speed(file_data_len);
+                }
+
+                // 剩余部分可能是Footer包
+                int remaining_len = rs - file_data_len;
+                if (remaining_len >= sizeof(FileFooterPacket)) {
+                    FileFooterPacket* footer = (FileFooterPacket*)(buffer.data() + file_data_len);
+                    if (strncmp(footer->marker, "FILE_TRANSFER_END", 17) == 0) {
+                        sender_md5_str = std::string(footer->md5, 32);
+                        received_footer = true;
+                        report_json("status", "message", "Received FileFooterPacket from sender (with data).");
+                    } else {
+                        // 不是Footer包，可能是数据错误
+                        report_json("warning", "message", "Unexpected data after file end");
+                    }
+                } else {
+                    // 剩余数据不够一个Footer包，等待更多数据
+                    expecting_footer = true;
+                }
+            }
         }
-
-        // 写入正常数据
-        ofs.write(buffer.data(), rs);
-        if (!ofs) {
-            report_json("error", "message", "Failed to write to file");
-            break;
-        }
-
-        total_recv += rs;
-
-        // 更新速度统计（累积字节数）
-        stats.update_speed(rs);
 
         auto now = std::chrono::steady_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_time).count();
         if (duration >= 500) {
-            // 使用stats中的当前速度，而不是重新计算
             report_progress(total_recv, hp.file_size, stats.current_speed_mbps, stats, true);
             last_time = now;
             last_bytes = total_recv;
@@ -1364,21 +1421,16 @@ void run_receiver(int port, const char *save_path) {
         }
     }
 
-    // 如果没有收到EOF标记但已经收到所有数据
-    if (!received_eof_marker && total_recv >= hp.file_size) {
-        report_json("warning", "message", "Received all data but no EOF marker, waiting for marker...");
-
-        // 继续接收，等待EOF标记
-        while (!received_eof_marker) {
-            char eof_buffer[256];
-            int rs = UDT::recv(recver, eof_buffer, sizeof(eof_buffer), 0);
-            if (rs <= 0) break;
-
-            std::string received_data(eof_buffer, rs);
-            if (received_data.find("FILE_TRANSMISSION_COMPLETE_EOF") != std::string::npos) {
-                report_json("status", "message", "Received EOF marker from sender.");
-                received_eof_marker = true;
-                break;
+    // 如果还没有收到Footer包，尝试再接收一次
+    if (!received_footer && !expecting_footer) {
+        char footer_buffer[sizeof(FileFooterPacket)];
+        int rs = UDT::recv(recver, footer_buffer, sizeof(footer_buffer), 0);
+        if (rs >= sizeof(FileFooterPacket)) {
+            FileFooterPacket* footer = (FileFooterPacket*)footer_buffer;
+            if (strncmp(footer->marker, "FILE_TRANSFER_END", 17) == 0) {
+                sender_md5_str = std::string(footer->md5, 32);
+                received_footer = true;
+                report_json("status", "message", "Received FileFooterPacket after file data.");
             }
         }
     }
@@ -1389,14 +1441,16 @@ void run_receiver(int port, const char *save_path) {
     bool transfer_complete = false;
     std::string actual_md5;
 
-    if (total_recv >= hp.file_size) {
+    if (total_recv >= hp.file_size && received_footer) {
         report_json("status", "message", "File received completely, verifying MD5...");
 
-        // 计算MD5
-        actual_md5 = calculate_file_md5_utf8(final_save_path);
-        std::string expected_md5(hp.md5, 32);
+        // 【流式优化】计算最终的MD5
+        md5_finish(&md5_state, md5_digest);
+        std::stringstream md5_ss;
+        for (int i = 0; i < 16; ++i) md5_ss << std::hex << std::setw(2) << std::setfill('0') << (int) md5_digest[i];
+        actual_md5 = md5_ss.str();
 
-        bool md5_match = (actual_md5 == expected_md5);
+        bool md5_match = (actual_md5 == sender_md5_str);
         transfer_complete = md5_match;
 
         // 发送MD5校验结果给发送端
@@ -1446,8 +1500,14 @@ void run_receiver(int port, const char *save_path) {
             }
         }
     } else {
-        report_json("error", "message",
-                    "File incomplete: " + std::to_string(total_recv) + "/" + std::to_string(hp.file_size));
+        if (!received_footer) {
+            report_json("error", "message", "Did not receive file footer packet");
+        }
+
+        if (total_recv < hp.file_size) {
+            report_json("error", "message",
+                        "File incomplete: " + std::to_string(total_recv) + "/" + std::to_string(hp.file_size));
+        }
 
         // 发送失败状态
         TransferCompletePacket tcp;
@@ -1510,7 +1570,7 @@ void run_receiver(int port, const char *save_path) {
     // 输出最终的MD5校验结果（如果传输完成）
     if (transfer_complete) {
         std::cout << "{\"type\":\"final_verify\", \"success\":true"
-                << ", \"expected\":\"" << std::string(hp.md5, 32)
+                << ", \"expected\":\"" << sender_md5_str
                 << "\", \"actual\":\"" << actual_md5
                 << "\", \"file_path\":\"" << final_save_path
                 << "\", \"bytes_expected\":" << hp.file_size
@@ -1588,7 +1648,7 @@ int main(int argc, char *argv[]) {
         std::cerr << "  - MIME类型检测和传输" << std::endl;
         std::cerr << "  - 基于UDT4 API的准确网络统计" << std::endl;
         std::cerr << "  - 智能文件保存（目录或具体路径）" << std::endl;
-        std::cerr << "  - MD5校验确保数据完整性" << std::endl;
+        std::cerr << "  - 流式MD5计算（节省大文件传输时间）" << std::endl;
         std::cerr << std::endl;
         std::cerr << "示例:" << std::endl;
         std::cerr << "  # 使用自定义参数发送文件" << std::endl;
