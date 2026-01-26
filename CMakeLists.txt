@@ -102,8 +102,10 @@ else()
 
     elseif (COMPILER_TARGET STREQUAL "arm32")
         set(CMAKE_SYSTEM_NAME Linux)
-        set(CMAKE_C_COMPILER "/opt/gcc-linaro-7.5.0-2019.12-x86_64_arm-linux-gnueabihf/bin/arm-linux-gnueabihf-gcc")
-        set(CMAKE_CXX_COMPILER "/opt/gcc-linaro-7.5.0-2019.12-x86_64_arm-linux-gnueabihf/bin/arm-linux-gnueabihf-g++")
+        set(CMAKE_C_COMPILER "arm-linux-gnueabihf-gcc-8")
+        set(CMAKE_CXX_COMPILER "arm-linux-gnueabihf-g++-8")
+        #set(CMAKE_C_COMPILER "/opt/gcc-linaro-7.5.0-2019.12-x86_64_arm-linux-gnueabihf/bin/arm-linux-gnueabihf-gcc")
+        #set(CMAKE_CXX_COMPILER "/opt/gcc-linaro-7.5.0-2019.12-x86_64_arm-linux-gnueabihf/bin/arm-linux-gnueabihf-g++")
 
     elseif (COMPILER_TARGET STREQUAL "x86")
         set(CMAKE_C_COMPILER "gcc")
