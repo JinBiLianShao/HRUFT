@@ -74,8 +74,8 @@ struct FileFooterPacket {
 #pragma pack(pop)
 
 struct UDTConfig {
-    int mss = 1500;
-    int window_size = 10485760; // 默认 10MB
+    int mss = 9000; // 默认增大到9000，支持Jumbo Frames
+    int window_size = 67108864; // 默认 64MB
 };
 
 // ==========================================
@@ -715,6 +715,16 @@ void apply_socket_opts(UDTSOCKET sock, int mss, int win_size) {
     UDT::setsockopt(sock, 0, UDT_RCVBUF, &win_size, sizeof(int));
     UDT::setsockopt(sock, 0, UDP_SNDBUF, &win_size, sizeof(int));
     UDT::setsockopt(sock, 0, UDP_RCVBUF, &win_size, sizeof(int));
+
+    // 优化：设置原生UDP缓冲区
+    int max_buf = 67108864; // 64MB
+    ::setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (char*)&max_buf, sizeof(int));
+    ::setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (char*)&max_buf, sizeof(int));
+
+    // 端口复用
+    bool reuse = true;
+    UDT::setsockopt(sock, 0, UDT_REUSEADDR, &reuse, sizeof(bool));
+
     // =========================
     // 控制阶段：阻塞模式
     // =========================
@@ -921,7 +931,7 @@ void run_sender(const char *ip, int port, const char *filepath, const UDTConfig 
     stats.transferred_bytes += sizeof(HandshakePacket);
 
     // 2. 开始传输数据（边读边算BLAKE3）
-    std::vector<char> buffer(1024 * 1024 * 8);
+    std::vector<char> buffer(1024 * 1024 * 32); // 优化：增大缓冲区到32MB
     long long total_sent = 0;
     auto last_time = std::chrono::steady_clock::now();
     long long last_bytes = 0;
@@ -940,9 +950,16 @@ void run_sender(const char *ip, int port, const char *filepath, const UDTConfig 
         int offset = 0;
         while (offset < read_len) {
             int sent = UDT::send(client, buffer.data() + offset, read_len - offset, 0);
-            if (sent <= 0) {
-                report_json("error", "message", "Failed to send data");
-                break;
+            if (sent == UDT::ERROR) {
+                // 处理非阻塞错误
+                if (UDT::getlasterror().getErrorCode() == CUDTException::EASYNCSND) {
+                    // 缓冲满，短暂等待重试
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    continue;
+                } else {
+                    report_json("error", "message", "Failed to send data: " + std::string(UDT::getlasterror().getErrorMessage()));
+                    break;
+                }
             }
             offset += sent;
             total_sent += sent;
@@ -958,7 +975,7 @@ void run_sender(const char *ip, int port, const char *filepath, const UDTConfig 
 
         auto now = std::chrono::steady_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_time).count();
-        if (duration >= 500) {
+        if (duration >= 1000) { // 优化：报告间隔从500ms到1s
             // 使用stats中的当前速度，而不是重新计算
             report_progress(total_sent, f_size, stats.current_speed_mbps, stats, true);
             last_time = now;
@@ -1344,7 +1361,7 @@ void run_receiver(int port, const char *save_path) {
     }
 
     long long total_recv = 0;
-    std::vector<char> buffer(1024 * 1024 * 8);
+    std::vector<char> buffer(1024 * 1024 * 32); // 优化：增大缓冲区到32MB
     auto last_time = std::chrono::steady_clock::now();
     long long last_bytes = 0;
 
@@ -1358,8 +1375,14 @@ void run_receiver(int port, const char *save_path) {
         int rs = UDT::recv(recver, buffer.data(), (int) buffer.size(), 0);
         if (rs <= 0) {
             if (rs == UDT::ERROR) {
-                report_json("warning", "message",
-                            "Receive error: " + std::string(UDT::getlasterror().getErrorMessage()));
+                if (UDT::getlasterror().getErrorCode() == CUDTException::EASYNCRCV) {
+                    // 缓冲空，短暂等待重试
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    continue;
+                } else {
+                    report_json("warning", "message",
+                                "Receive error: " + std::string(UDT::getlasterror().getErrorMessage()));
+                }
             }
             break;
         }
@@ -1421,7 +1444,7 @@ void run_receiver(int port, const char *save_path) {
 
         auto now = std::chrono::steady_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_time).count();
-        if (duration >= 500) {
+        if (duration >= 1000) { // 优化：报告间隔从500ms到1s
             report_progress(total_recv, hp.file_size, stats.current_speed_mbps, stats, true);
             last_time = now;
             last_bytes = total_recv;
