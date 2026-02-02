@@ -179,15 +179,47 @@ target_include_directories(${PROJECT_NAME} PUBLIC ${INCLUDE_DIRS})
 # ---------------------------------------------------------------------------------------
 if (TARGET_TYPE STREQUAL "executable")
     if (TARGET_OS STREQUAL "windows")
+        # 移除无效的 -static-libblake3
         set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static-libgcc -static-libstdc++ -static")
         set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -static-libgcc -static-libstdc++ -static")
+
         add_definitions(-D_WIN32_WINNT=0x0600)
         target_link_libraries(${PROJECT_NAME} PRIVATE ws2_32 wsock32 iphlpapi shlwapi)
+
+        # ───── 新增：链接本地 blake3 静态库 ─────
+        # 根据架构选择对应的静态库路径
+        if(COMPILER_TARGET STREQUAL "x86")
+            set(BLAKE3_LIB_DIR "${CMAKE_SOURCE_DIR}/lib/win")
+            message(WARNING "No blake3 lib for arch ${COMPILER_TARGET}, skipping blake3 link")
+        endif()
+
+        if(EXISTS "${BLAKE3_LIB_DIR}")
+            target_link_directories(${PROJECT_NAME} PRIVATE "${BLAKE3_LIB_DIR}")
+            target_link_libraries(${PROJECT_NAME} PRIVATE blake3)   # 假设库名为 libblake3.a 或 blake3.lib
+            message(STATUS "Linked blake3 from: ${BLAKE3_LIB_DIR}")
+        else()
+            message(WARNING "blake3 lib directory not found: ${BLAKE3_LIB_DIR}")
+        endif()
+
     else()
         # Linux 基础系统库
         target_link_libraries(${PROJECT_NAME} PRIVATE pthread rt dl m)
+
+        # Linux 下也链接 blake3（如果有）
+        if(COMPILER_TARGET STREQUAL "arm64")
+            set(BLAKE3_LIB_DIR "${CMAKE_SOURCE_DIR}/lib/arm64")
+        elseif(COMPILER_TARGET STREQUAL "arm32")
+            set(BLAKE3_LIB_DIR "${CMAKE_SOURCE_DIR}/lib/arm32")
+        else()
+            set(BLAKE3_LIB_DIR "${CMAKE_SOURCE_DIR}/lib/linux")
+        endif()
+
+        if(EXISTS "${BLAKE3_LIB_DIR}")
+            target_link_directories(${PROJECT_NAME} PRIVATE "${BLAKE3_LIB_DIR}")
+            target_link_libraries(${PROJECT_NAME} PRIVATE blake3)
+        endif()
     endif()
-endif ()
+endif()
 
 # ---------------------------------------------------------------------------------------
 # 7. OpenMP 支持

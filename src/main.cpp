@@ -34,6 +34,7 @@
 
 #include "udt.h"
 #include "md5.h"
+#include "blake3.h"
 
 // ==========================================
 // 协议定义
@@ -43,7 +44,7 @@
 #pragma pack(push, 1)
 struct HandshakePacket {
     long long file_size; // 文件总大小
-    char md5[32]; // MD5字符串（流式优化后填0）
+    uint8_t hash[32]; // BLAKE3原始值（流式优化后填0）
     int mss; // 发送端指定的MSS
     int window_size; // 发送端指定的Window Size
     char filename[512]; // 文件名（扩大缓冲区以支持UTF-8编码的中文）
@@ -57,24 +58,24 @@ struct HandshakePacket {
 // 传输完成确认包
 #pragma pack(push, 1)
 struct TransferCompletePacket {
-    int32_t status; // 0: 等待MD5校验, 1: MD5校验成功, 2: MD5校验失败
-    char md5[32]; // 接收端计算的MD5
+    int32_t status; // 0: 等待校验, 1: 校验成功, 2: 校验失败
+    uint8_t hash[32]; // 接收端计算的BLAKE3原始值
     int64_t received_bytes; // 接收端实际接收的字节数
     int64_t missing_count; // 缺失的包数量(如果有)
 };
 #pragma pack(pop)
 
-// 新增：文件传输结束包，包含发送端边传边算的MD5
+// 新增：文件传输结束包，包含发送端边传边算的BLAKE3原始值
 #pragma pack(push, 1)
 struct FileFooterPacket {
     char marker[32]; // 固定标记 "FILE_TRANSFER_END"
-    char md5[32];    // 发送端计算出的最终MD5
+    uint8_t hash[32];    // 发送端计算出的最终BLAKE3原始值
 };
 #pragma pack(pop)
 
 struct UDTConfig {
     int mss = 1500;
-    int window_size = 10485760; // 默认 1MB
+    int window_size = 10485760; // 默认 10MB
 };
 
 // ==========================================
@@ -664,6 +665,18 @@ void report_progress(long long current, long long total, double speed_mbps,
     }
 }
 
+// 把字节数组转为小写十六进制字符串（64字符）
+std::string to_hex(const uint8_t* bytes, size_t len) {
+    std::string s;
+    s.reserve(len * 2);
+    const char* hex = "0123456789abcdef";
+    for (size_t i = 0; i < len; ++i) {
+        s += hex[(bytes[i] >> 4) & 0xF];
+        s += hex[bytes[i] & 0xF];
+    }
+    return s;
+}
+
 // 使用UTF-8路径计算文件MD5（保留用于其他用途，流式优化后不再用于传输中）
 std::string calculate_file_md5_utf8(const std::string &utf8_filepath) {
 #ifdef _WIN32
@@ -773,7 +786,7 @@ long long get_file_size_utf8(const std::string &utf8_filepath) {
 }
 
 // ==========================================
-// 发送端逻辑（已优化为流式计算MD5）
+// 发送端逻辑（已优化为流式计算BLAKE3）
 // ==========================================
 
 void run_sender(const char *ip, int port, const char *filepath, const UDTConfig &config) {
@@ -797,8 +810,8 @@ void run_sender(const char *ip, int port, const char *filepath, const UDTConfig 
     utf8_filepath = filepath; // Linux/macOS直接使用UTF-8
 #endif
 
-    // 【流式优化】删除预先计算MD5，改为流式计算
-    report_json("status", "message", "Starting file transmission with streaming MD5...");
+    // 【流式优化】删除预先计算哈希，改为流式计算
+    report_json("status", "message", "Starting file transmission with streaming BLAKE3...");
 
     UDTSOCKET client = UDT::socket(AF_INET, SOCK_STREAM, 0);
     if (client == UDT::INVALID_SOCK) {
@@ -836,10 +849,10 @@ void run_sender(const char *ip, int port, const char *filepath, const UDTConfig 
     long long f_size = ifs.tellg();
     ifs.seekg(0, std::ios::beg);
 
-    // 【流式优化】初始化流式MD5
-    md5_state_t md5_state;
-    md5_byte_t md5_digest[16];
-    md5_init(&md5_state);
+    // 【流式优化】初始化流式BLAKE3
+    blake3_hasher blake3_state;
+    uint8_t blake3_digest[32];
+    blake3_hasher_init(&blake3_state);
 
     // 提取文件信息（使用UTF-8）
     std::string filename;
@@ -885,8 +898,8 @@ void run_sender(const char *ip, int port, const char *filepath, const UDTConfig 
     hp.mss = config.mss;
     hp.window_size = config.window_size;
 
-    // 【流式优化】握手包中不再发送真实MD5，填0即可
-    memset(hp.md5, 0, 32);
+    // 【流式优化】握手包中不再发送真实哈希，填0即可
+    memset(hp.hash, 0, 32);
 
     // 清空字符串字段
     memset(hp.filename, 0, sizeof(hp.filename));
@@ -907,7 +920,7 @@ void run_sender(const char *ip, int port, const char *filepath, const UDTConfig 
     }
     stats.transferred_bytes += sizeof(HandshakePacket);
 
-    // 2. 开始传输数据（边读边算MD5）
+    // 2. 开始传输数据（边读边算BLAKE3）
     std::vector<char> buffer(1024 * 1024 * 8);
     long long total_sent = 0;
     auto last_time = std::chrono::steady_clock::now();
@@ -921,8 +934,8 @@ void run_sender(const char *ip, int port, const char *filepath, const UDTConfig 
         int read_len = (int) ifs.gcount();
         if (read_len <= 0) break;
 
-        // 【流式优化】在发送的同时计算MD5
-        md5_append(&md5_state, (const md5_byte_t *)buffer.data(), read_len);
+        // 【流式优化】在发送的同时计算BLAKE3
+        blake3_hasher_update(&blake3_state, (const uint8_t *)buffer.data(), read_len);
 
         int offset = 0;
         while (offset < read_len) {
@@ -965,20 +978,18 @@ void run_sender(const char *ip, int port, const char *filepath, const UDTConfig 
         return;
     }
 
-    // 【流式优化】计算最终MD5
-    md5_finish(&md5_state, md5_digest);
+    // 【流式优化】计算最终BLAKE3
+    blake3_hasher_finalize(&blake3_state, blake3_digest, 32);
 
-    std::stringstream md5_ss;
-    for (int i = 0; i < 16; ++i) md5_ss << std::hex << std::setw(2) << std::setfill('0') << (int) md5_digest[i];
-    std::string final_md5_str = md5_ss.str();
+    std::string final_hash_str = to_hex(blake3_digest, 32);
 
-    report_json("status", "message", "File data sent. MD5 calculated: " + final_md5_str);
+    report_json("status", "message", "File data sent. BLAKE3 calculated: " + final_hash_str);
 
     // 【流式优化】发送结构化的结束包，而不是原来的字符串EOF
     FileFooterPacket footer;
     memset(&footer, 0, sizeof(footer));
     strcpy(footer.marker, "FILE_TRANSFER_END");
-    memcpy(footer.md5, final_md5_str.c_str(), 32);
+    memcpy(footer.hash, blake3_digest, 32);
 
     if (UDT::ERROR == UDT::send(client, (char*)&footer, sizeof(footer), 0)) {
         report_json("warning", "message", "Failed to send file footer packet");
@@ -986,7 +997,7 @@ void run_sender(const char *ip, int port, const char *filepath, const UDTConfig 
         report_json("status", "message", "File footer sent, waiting for receiver to finish...");
     }
 
-    // 等待接收端完成接收并返回MD5校验结果
+    // 等待接收端完成接收并返回校验结果
     TransferCompletePacket tcp;
 
     int recv_result = UDT::recv(client, (char *) &tcp, sizeof(TransferCompletePacket), 0);
@@ -1000,30 +1011,30 @@ void run_sender(const char *ip, int port, const char *filepath, const UDTConfig 
         stats.collect_udt_stats(client);
 
         std::stringstream result_info;
-        result_info << "Receiver MD5 verification ";
+        result_info << "Receiver BLAKE3 verification ";
 
         if (tcp.status == 1) {
             result_info << "PASSED! Received: " << tcp.received_bytes << " bytes";
             report_json("success", "message", result_info.str());
 
-            // 比较MD5
-            std::string expected_md5(final_md5_str); // 【修改】使用流式计算的MD5
-            std::string actual_md5(tcp.md5, 32);
+            // 比较哈希
+            std::string expected_hash = final_hash_str; // 【修改】使用流式计算的哈希
+            std::string actual_hash = to_hex(tcp.hash, 32);
 
             std::cout << "{\"type\":\"verify\", \"success\":true"
-                    << ", \"expected\":\"" << expected_md5
-                    << "\", \"actual\":\"" << actual_md5
+                    << ", \"expected\":\"" << expected_hash
+                    << "\", \"actual\":\"" << actual_hash
                     << "\", \"bytes_sent\":" << total_sent
                     << ", \"bytes_received\":" << tcp.received_bytes
                     << "}" << std::endl;
         } else if (tcp.status == 2) {
-            result_info << "FAILED! Expected: " << final_md5_str
-                    << ", Got: " << std::string(tcp.md5, 32);
+            result_info << "FAILED! Expected: " << final_hash_str
+                    << ", Got: " << to_hex(tcp.hash, 32);
             report_json("error", "message", result_info.str());
 
             std::cout << "{\"type\":\"verify\", \"success\":false"
-                    << ", \"expected\":\"" << final_md5_str
-                    << "\", \"actual\":\"" << std::string(tcp.md5, 32)
+                    << ", \"expected\":\"" << final_hash_str
+                    << "\", \"actual\":\"" << to_hex(tcp.hash, 32)
                     << "\", \"bytes_sent\":" << total_sent
                     << ", \"bytes_received\":" << tcp.received_bytes
                     << "}" << std::endl;
@@ -1076,7 +1087,6 @@ void run_sender(const char *ip, int port, const char *filepath, const UDTConfig 
     int linger_time = 5000;
     UDT::setsockopt(client, 0, UDT_LINGER, &linger, sizeof(bool));
 
-    // 等待一小段时间让接收端处理
 #ifdef _WIN32
     Sleep(100);
 #else
@@ -1091,7 +1101,7 @@ void run_sender(const char *ip, int port, const char *filepath, const UDTConfig 
 }
 
 // ==========================================
-// 接收端逻辑（已优化为流式计算MD5）
+// 接收端逻辑（已优化为流式计算BLAKE3）
 // ==========================================
 
 void run_receiver(int port, const char *save_path) {
@@ -1313,10 +1323,10 @@ void run_receiver(int port, const char *save_path) {
     info << " -> " << final_save_path;
     report_json("status", "message", info.str());
 
-    // 【流式优化】初始化流式MD5
-    md5_state_t md5_state;
-    md5_byte_t md5_digest[16];
-    md5_init(&md5_state);
+    // 【流式优化】初始化流式BLAKE3
+    blake3_hasher blake3_state;
+    uint8_t blake3_digest[32];
+    blake3_hasher_init(&blake3_state);
 
     // 3. 初始化传输统计
     TransferStatistics stats;
@@ -1340,7 +1350,7 @@ void run_receiver(int port, const char *save_path) {
 
     // 【流式优化】替换原来的字符串EOF检测
     bool received_footer = false;
-    std::string sender_md5_str; // 存储发送端发来的MD5
+    std::string sender_hash_str; // 存储发送端发来的哈希 hex
     bool expecting_footer = false;
 
     // 持续接收直到收到Footer包
@@ -1361,7 +1371,7 @@ void run_receiver(int port, const char *save_path) {
             if (rs >= sizeof(FileFooterPacket)) {
                 FileFooterPacket* footer = (FileFooterPacket*)buffer.data();
                 if (strncmp(footer->marker, "FILE_TRANSFER_END", 17) == 0) {
-                    sender_md5_str = std::string(footer->md5, 32);
+                    sender_hash_str = to_hex(footer->hash, 32);
                     received_footer = true;
                     report_json("status", "message", "Received FileFooterPacket from sender.");
                     break;
@@ -1373,7 +1383,7 @@ void run_receiver(int port, const char *save_path) {
 
             if (rs <= remaining_file_data) {
                 // 整个包都是文件数据
-                md5_append(&md5_state, (const md5_byte_t*)buffer.data(), rs);
+                blake3_hasher_update(&blake3_state, (const uint8_t*)buffer.data(), rs);
                 ofs.write(buffer.data(), rs);
                 total_recv += rs;
 
@@ -1384,7 +1394,7 @@ void run_receiver(int port, const char *save_path) {
                 // 首先，取出文件数据的最后一部分
                 int file_data_len = (int)remaining_file_data;
                 if (file_data_len > 0) {
-                    md5_append(&md5_state, (const md5_byte_t*)buffer.data(), file_data_len);
+                    blake3_hasher_update(&blake3_state, (const uint8_t*)buffer.data(), file_data_len);
                     ofs.write(buffer.data(), file_data_len);
                     total_recv += file_data_len;
                     stats.update_speed(file_data_len);
@@ -1395,7 +1405,7 @@ void run_receiver(int port, const char *save_path) {
                 if (remaining_len >= sizeof(FileFooterPacket)) {
                     FileFooterPacket* footer = (FileFooterPacket*)(buffer.data() + file_data_len);
                     if (strncmp(footer->marker, "FILE_TRANSFER_END", 17) == 0) {
-                        sender_md5_str = std::string(footer->md5, 32);
+                        sender_hash_str = to_hex(footer->hash, 32);
                         received_footer = true;
                         report_json("status", "message", "Received FileFooterPacket from sender (with data).");
                     } else {
@@ -1428,7 +1438,7 @@ void run_receiver(int port, const char *save_path) {
         if (rs >= sizeof(FileFooterPacket)) {
             FileFooterPacket* footer = (FileFooterPacket*)footer_buffer;
             if (strncmp(footer->marker, "FILE_TRANSFER_END", 17) == 0) {
-                sender_md5_str = std::string(footer->md5, 32);
+                sender_hash_str = to_hex(footer->hash, 32);
                 received_footer = true;
                 report_json("status", "message", "Received FileFooterPacket after file data.");
             }
@@ -1437,33 +1447,30 @@ void run_receiver(int port, const char *save_path) {
 
     ofs.close();
 
-    // 检查文件完整性并计算MD5
+    // 检查文件完整性并计算哈希
     bool transfer_complete = false;
-    std::string actual_md5;
+    std::string actual_hash;
 
     if (total_recv >= hp.file_size && received_footer) {
-        report_json("status", "message", "File received completely, verifying MD5...");
+        report_json("status", "message", "File received completely, verifying BLAKE3...");
 
-        // 【流式优化】计算最终的MD5
-        md5_finish(&md5_state, md5_digest);
-        std::stringstream md5_ss;
-        for (int i = 0; i < 16; ++i) md5_ss << std::hex << std::setw(2) << std::setfill('0') << (int) md5_digest[i];
-        actual_md5 = md5_ss.str();
+        // 【流式优化】计算最终的BLAKE3
+        blake3_hasher_finalize(&blake3_state, blake3_digest, 32);
 
-        bool md5_match = (actual_md5 == sender_md5_str);
-        transfer_complete = md5_match;
+        actual_hash = to_hex(blake3_digest, 32);
 
-        // 发送MD5校验结果给发送端
+        bool hash_match = (sender_hash_str == actual_hash);
+        transfer_complete = hash_match;
+
+        // 发送校验结果给发送端
         TransferCompletePacket tcp;
-        tcp.status = md5_match ? 1 : 2;
+        tcp.status = hash_match ? 1 : 2;
         tcp.received_bytes = total_recv;
         tcp.missing_count = (hp.file_size - total_recv) > 0 ? (hp.file_size - total_recv) : 0;
 
-        // 复制MD5
-        memset(tcp.md5, 0, sizeof(tcp.md5));
-        if (!actual_md5.empty() && actual_md5.length() >= 32) {
-            memcpy(tcp.md5, actual_md5.c_str(), 32);
-        }
+        // 复制哈希
+        memset(tcp.hash, 0, sizeof(tcp.hash));
+        memcpy(tcp.hash, blake3_digest, 32);
 
         // 设置发送超时
         int send_timeout = 5000;
@@ -1472,10 +1479,10 @@ void run_receiver(int port, const char *save_path) {
         if (UDT::ERROR == UDT::send(recver, (char *) &tcp, sizeof(TransferCompletePacket), 0)) {
             report_json("warning", "message", "Failed to send verification result to sender");
         } else {
-            if (md5_match) {
-                report_json("success", "message", "MD5 verification passed!");
+            if (hash_match) {
+                report_json("success", "message", "BLAKE3 verification passed!");
             } else {
-                report_json("error", "message", "MD5 verification failed!");
+                report_json("error", "message", "BLAKE3 verification failed!");
             }
 
             // 等待发送端的统计信息
@@ -1514,7 +1521,7 @@ void run_receiver(int port, const char *save_path) {
         tcp.status = 2; // 失败
         tcp.received_bytes = total_recv;
         tcp.missing_count = hp.file_size - total_recv;
-        memset(tcp.md5, 0, sizeof(tcp.md5));
+        memset(tcp.hash, 0, sizeof(tcp.hash));
 
         UDT::send(recver, (char *) &tcp, sizeof(TransferCompletePacket), 0);
 
@@ -1551,7 +1558,6 @@ void run_receiver(int port, const char *save_path) {
     int linger_time = 3000;
     UDT::setsockopt(recver, 0, UDT_LINGER, &linger, sizeof(bool));
 
-    // 等待一小段时间确保发送端已经关闭
 #ifdef _WIN32
     Sleep(50);
 #else
@@ -1567,11 +1573,11 @@ void run_receiver(int port, const char *save_path) {
 
     report_json("status", "message", "Receiver connection closed.");
 
-    // 输出最终的MD5校验结果（如果传输完成）
+    // 输出最终的校验结果（如果传输完成）
     if (transfer_complete) {
         std::cout << "{\"type\":\"final_verify\", \"success\":true"
-                << ", \"expected\":\"" << sender_md5_str
-                << "\", \"actual\":\"" << actual_md5
+                << ", \"expected\":\"" << sender_hash_str
+                << "\", \"actual\":\"" << actual_hash
                 << "\", \"file_path\":\"" << final_save_path
                 << "\", \"bytes_expected\":" << hp.file_size
                 << ", \"bytes_received\":" << total_recv << "}" << std::endl;
@@ -1648,7 +1654,7 @@ int main(int argc, char *argv[]) {
         std::cerr << "  - MIME类型检测和传输" << std::endl;
         std::cerr << "  - 基于UDT4 API的准确网络统计" << std::endl;
         std::cerr << "  - 智能文件保存（目录或具体路径）" << std::endl;
-        std::cerr << "  - 流式MD5计算（节省大文件传输时间）" << std::endl;
+        std::cerr << "  - 流式BLAKE3计算（节省大文件传输时间）" << std::endl;
         std::cerr << std::endl;
         std::cerr << "示例:" << std::endl;
         std::cerr << "  # 使用自定义参数发送文件" << std::endl;
