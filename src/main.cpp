@@ -19,6 +19,8 @@
 #include <unistd.h>
 #include <codecvt>
 #include <locale>
+#include <atomic>
+#include <mutex>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -35,6 +37,52 @@
 #include "udt.h"
 #include "md5.h"
 #include "blake3.h"
+
+
+// ==========================================
+// Windows CMD卡死问题修复
+// ==========================================
+
+#ifdef _WIN32
+// 禁用Windows控制台的Quick Edit模式,防止程序卡死
+void disable_quick_edit_mode() {
+    HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD mode = 0;
+    GetConsoleMode(hStdin, &mode);
+    mode &= ~ENABLE_QUICK_EDIT_MODE;
+    mode &= ~ENABLE_INSERT_MODE;
+    mode &= ~ENABLE_MOUSE_INPUT;
+    SetConsoleMode(hStdin, mode | ENABLE_EXTENDED_FLAGS);
+}
+
+void optimize_console_buffer() {
+    HANDLE hStdout = GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    if (GetConsoleScreenBufferInfo(hStdout, &csbi)) {
+        COORD newSize;
+        newSize.X = csbi.dwSize.X;
+        newSize.Y = 9999;
+        SetConsoleScreenBufferSize(hStdout, newSize);
+    }
+}
+
+void optimize_process_priority() {
+    SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+}
+#endif
+
+// ==========================================
+// 线程安全的输出管理
+// ==========================================
+
+std::mutex cout_mutex;
+
+void safe_print(const std::string &message) {
+    std::lock_guard<std::mutex> lock(cout_mutex);
+    std::cout << message << std::endl;
+    std::cout.flush();
+}
 
 // ==========================================
 // 协议定义
@@ -637,7 +685,9 @@ std::string get_mime_type_from_extension(const std::string &extension) {
 }
 
 void report_json(const std::string &type, const std::string &key, const std::string &val) {
-    std::cout << "{\"type\":\"" << type << "\", \"" << key << "\":\"" << val << "\"}" << std::endl;
+    std::stringstream ss;
+    ss << "{\"type\":\"" << type << "\", \"" << key << "\":\"" << val << "\"}";
+    safe_print(ss.str());
 }
 
 void report_progress(long long current, long long total, double speed_mbps,
@@ -1016,8 +1066,9 @@ void run_sender(const char *ip, int port, const char *filepath, const UDTConfig 
 
     // 等待接收端完成接收并返回校验结果
     TransferCompletePacket tcp;
+    int recv_result = 0;
 
-    int recv_result = UDT::recv(client, (char *) &tcp, sizeof(TransferCompletePacket), 0);
+    recv_result = UDT::recv(client, (char *) &tcp, sizeof(TransferCompletePacket), 0);
 
     // 记录结束时间
     stats.end_time = std::chrono::steady_clock::now();
@@ -1613,6 +1664,11 @@ void run_receiver(int port, const char *save_path) {
 
 int main(int argc, char *argv[]) {
 #ifdef _WIN32
+    // Windows卡死修复 - 必须在最开始执行
+    disable_quick_edit_mode();
+    optimize_console_buffer();
+    optimize_process_priority();
+
     // 强制设置控制台输出代码页为 UTF-8 (65001)
     SetConsoleOutputCP(CP_UTF8);
     // 设置控制台输入代码页为 UTF-8
