@@ -1,11 +1,9 @@
 /**
- * HRUFT Pro (High Reliability UDT File Transfer - Professional)
+* HRUFT Pro (High Reliability UDT File Transfer - Professional)
  * * Dependencies:
  * 1. UDT4 Library (libudt)
  * 2. BLAKE3 Library (libblake3)
  * 3. nlohmann/json (json.hpp)
- * * Compile (Linux):
- * g++ -std=c++17 -O3 -o hruft hruft_pro.cpp -I./include -L./lib -ludt -lblake3 -lpthread
  */
 
 #include <iostream>
@@ -23,15 +21,15 @@
 #include <condition_variable>
 #include <mutex>
 
-// Network & Dependencies
 #ifdef _WIN32
-    #include <winsock2.h>
-    #include <ws2tcpip.h>
-    #pragma comment(lib, "ws2_32.lib")
+#include <windows.h>   // ====== 中文支持新增 ======
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
 #else
-    #include <arpa/inet.h>
-    #include <netdb.h>
-    #include <unistd.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <unistd.h>
 #endif
 
 #include <udt.h>
@@ -41,27 +39,52 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
+#ifdef _WIN32
+// ====== 中文支持新增：UTF-8 <-> UTF-16 转换 ======
+class Utf8Util {
+public:
+    static std::wstring toWide(const std::string &s) {
+        if (s.empty()) return L"";
+        int sz = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+        std::wstring w(sz, 0);
+        MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &w[0], sz);
+        w.pop_back();
+        return w;
+    }
+
+    static std::string toUtf8(const std::wstring &w) {
+        if (w.empty()) return "";
+        int sz = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr);
+        std::string s(sz, 0);
+        WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, &s[0], sz, nullptr, nullptr);
+        s.pop_back();
+        return s;
+    }
+};
+#endif
+
+
 // --- 64位字节序转换宏 ---
 #ifdef _WIN32
-    #ifdef _MSC_VER
-        #include <stdlib.h>
-        #define htonll(x) _byteswap_uint64(x)
-        #define ntohll(x) _byteswap_uint64(x)
-    #else
-        // MinGW
-        #define htonll(x) (((uint64_t)htonl((x) & 0xFFFFFFFF) << 32) | htonl((x) >> 32))
-        #define ntohll(x) (((uint64_t)ntohl((x) & 0xFFFFFFFF) << 32) | ntohl((x) >> 32))
-    #endif
+#ifdef _MSC_VER
+#include <stdlib.h>
+#define htonll(x) _byteswap_uint64(x)
+#define ntohll(x) _byteswap_uint64(x)
 #else
-    #include <endian.h>
-    #define htonll htobe64
-    #define ntohll be64toh
+// MinGW
+#define htonll(x) (((uint64_t)htonl((x) & 0xFFFFFFFF) << 32) | htonl((x) >> 32))
+#define ntohll(x) (((uint64_t)ntohl((x) & 0xFFFFFFFF) << 32) | ntohl((x) >> 32))
+#endif
+#else
+#include <endian.h>
+#define htonll htobe64
+#define ntohll be64toh
 #endif
 
 // --- 高性能配置常量 ---
 const uint32_t MAGIC_ID = 0x48525032; // "HRP2" in ASCII
 const int APP_BLOCK_SIZE = 4 * 1024 * 1024; // 4MB 应用层分块
-const int UDT_MAX_BUF = 256 * 1024 * 1024;  // 256MB 最大缓冲
+const int UDT_MAX_BUF = 256 * 1024 * 1024; // 256MB 最大缓冲
 const std::string TRANSFER_COMPLETE = "TRANSFER_COMPLETE";
 const std::string ACK_TRANSFER = "ACK_TRANSFER";
 const int DEFAULT_MSS = 1500;
@@ -83,7 +106,7 @@ struct ProtocolHeader {
 class NetworkStats {
 public:
     // 将 UDT TRACEINFO 转换为详细 JSON
-    static json snapshot(UDT::TRACEINFO& perf, double duration, uint64_t totalBytes) {
+    static json snapshot(UDT::TRACEINFO &perf, double duration, uint64_t totalBytes) {
         json j;
 
         // 1. 速率统计
@@ -106,8 +129,10 @@ public:
             {"pkt_loss_sent", perf.pktSndLossTotal},
             {"pkt_loss_recv", perf.pktRcvLossTotal},
             {"retrans_total", perf.pktRetransTotal},
-            {"retrans_ratio", (perf.pktSentTotal > 0 ?
-                static_cast<double>(perf.pktRetransTotal) / perf.pktSentTotal : 0.0)}
+            {
+                "retrans_ratio",
+                (perf.pktSentTotal > 0 ? static_cast<double>(perf.pktRetransTotal) / perf.pktSentTotal : 0.0)
+            }
         });
 
         // 4. 拥塞控制内部状态
@@ -127,7 +152,7 @@ public:
     }
 
     // 智能分析引擎
-    static json analyze(const json& stats, int configMss, int configWin) {
+    static json analyze(const json &stats, int configMss, int configWin) {
         json report = stats;
         std::vector<std::string> advice;
         std::string health = "excellent";
@@ -142,13 +167,13 @@ public:
             bandwidth = stats["throughput"]["est_bandwidth_mbps"];
             rtt = stats["latency"]["rtt_ms"];
             availRcvBuf = stats["buffer_health"]["rcv_buf_avail_bytes"];
-        } catch (const json::exception& e) {
+        } catch (const json::exception &e) {
             health = "unknown";
             advice.push_back("无法获取完整统计信息");
         }
 
         // BDP 计算: Bandwidth (bits/sec) * RTT (sec) / 8 = Bytes
-        long long bdp = (long long)((bandwidth * 1e6 * rtt * 1e-3) / 8.0);
+        long long bdp = (long long) ((bandwidth * 1e6 * rtt * 1e-3) / 8.0);
 
         // --- 规则引擎 ---
 
@@ -165,9 +190,10 @@ public:
         }
 
         // 3. 链路质量
-        if (lossRate > 0.01) { // > 1% 重传
+        if (lossRate > 0.01) {
+            // > 1% 重传
             advice.push_back("网络质量: 高重传率 (" +
-                             std::to_string(lossRate*100) + "%)。检查网络稳定性。");
+                             std::to_string(lossRate * 100) + "%)。检查网络稳定性。");
             health = "network_lossy";
             if (configMss > 1400) {
                 advice.push_back("优化建议: 尝试减少MSS到1400以避免IP分片。");
@@ -196,7 +222,7 @@ struct Config {
     int window = DEFAULT_WINDOW;
     bool detailed = false;
 
-    static Config parse(int argc, char* argv[]) {
+    static Config parse(int argc, char *argv[]) {
         Config c;
         if (argc < 2) {
             printUsage();
@@ -254,20 +280,20 @@ struct Config {
 
     static void printUsage() {
         std::cerr << "Usage:\n"
-                  << "  hruft send <ip> <port> <filepath> [options]\n"
-                  << "  hruft recv <port> <savepath> [options]\n\n"
-                  << "Options:\n"
-                  << "  --mss <value>      Maximum Segment Size (default: 1500)\n"
-                  << "  --window <value>   Window size in bytes (default: "
-                  << DEFAULT_WINDOW / (1024*1024) << "MB)\n"
-                  << "  --detailed         Show detailed statistics\n";
+                << "  hruft send <ip> <port> <filepath> [options]\n"
+                << "  hruft recv <port> <savepath> [options]\n\n"
+                << "Options:\n"
+                << "  --mss <value>      Maximum Segment Size (default: 1500)\n"
+                << "  --window <value>   Window size in bytes (default: "
+                << DEFAULT_WINDOW / (1024 * 1024) << "MB)\n"
+                << "  --detailed         Show detailed statistics\n";
     }
 };
 
 // --- 辅助函数 ---
 class Utils {
 public:
-    static bool waitForAck(UDTSOCKET sock, const std::string& expected, int timeout_ms = 10000) {
+    static bool waitForAck(UDTSOCKET sock, const std::string &expected, int timeout_ms = 10000) {
         char buf[256];
         int original_timeout = 0;
         int timeout_len = sizeof(int);
@@ -278,7 +304,7 @@ public:
         // 设置新超时
         UDT::setsockopt(sock, 0, UDT_RCVTIMEO, &timeout_ms, sizeof(int));
 
-        int r = UDT::recv(sock, buf, sizeof(buf)-1, 0);
+        int r = UDT::recv(sock, buf, sizeof(buf) - 1, 0);
 
         // 恢复原始超时
         UDT::setsockopt(sock, 0, UDT_RCVTIMEO, &original_timeout, sizeof(int));
@@ -290,17 +316,17 @@ public:
         return false;
     }
 
-    static std::string hashToString(const uint8_t* hash, size_t len) {
+    static std::string hashToString(const uint8_t *hash, size_t len) {
         std::stringstream ss;
         for (size_t i = 0; i < len; ++i) {
             ss << std::hex << std::setw(2) << std::setfill('0')
-               << static_cast<int>(hash[i]);
+                    << static_cast<int>(hash[i]);
         }
         return ss.str();
     }
 
     static std::string formatSize(uint64_t bytes) {
-        const char* units[] = {"B", "KB", "MB", "GB", "TB"};
+        const char *units[] = {"B", "KB", "MB", "GB", "TB"};
         int unit = 0;
         double size = static_cast<double>(bytes);
 
@@ -367,13 +393,23 @@ public:
     }
 
     void runSender() {
-        // 检查文件是否存在
-        if (!fs::exists(cfg.path)) {
+#ifdef _WIN32
+        fs::path filePath = fs::path(Utf8Util::toWide(cfg.path)); // 中文路径
+#else
+        fs::path filePath = fs::path(cfg.path);
+#endif
+
+        if (!fs::exists(filePath)) {
             throw std::runtime_error("File not found: " + cfg.path);
         }
 
-        uint64_t fsize = fs::file_size(cfg.path);
-        std::string fname = fs::path(cfg.path).filename().string();
+        uint64_t fsize = fs::file_size(filePath);
+
+#ifdef _WIN32
+        std::string fname = Utf8Util::toUtf8(filePath.filename().wstring()); // UTF-8 文件名跨平台
+#else
+        std::string fname = filePath.filename().string();
+#endif
 
         if (fname.size() > 65535) {
             throw std::runtime_error("Filename too long");
@@ -397,7 +433,7 @@ public:
 
         std::cout << "[INFO] Connecting to " << cfg.ip << ":" << cfg.port << "..." << std::endl;
 
-        if (UDT::ERROR == UDT::connect(sock, (sockaddr*)&serv_addr, sizeof(serv_addr))) {
+        if (UDT::ERROR == UDT::connect(sock, (sockaddr *) &serv_addr, sizeof(serv_addr))) {
             std::string error = UDT::getlasterror().getErrorMessage();
             throw std::runtime_error("Connect failed: " + error);
         }
@@ -413,7 +449,7 @@ public:
         hdr.filename_len = htons(static_cast<uint16_t>(fname.size()));
 
         // 发送协议头
-        if (UDT::send(sock, (char*)&hdr, sizeof(hdr), 0) <= 0) {
+        if (UDT::send(sock, (char *) &hdr, sizeof(hdr), 0) <= 0) {
             throw std::runtime_error("Failed to send protocol header");
         }
 
@@ -423,7 +459,7 @@ public:
         }
 
         // 传输文件数据
-        std::ifstream ifs(cfg.path, std::ios::binary);
+        std::ifstream ifs(filePath, std::ios::binary);
         if (!ifs) {
             throw std::runtime_error("Cannot open file for reading: " + cfg.path);
         }
@@ -457,13 +493,13 @@ public:
             if (cfg.detailed || elapsed >= 1000) {
                 double progress = (fsize > 0) ? (static_cast<double>(sent) / fsize * 100.0) : 0.0;
                 std::cout << "\r[Progress] " << std::fixed << std::setprecision(1) << progress
-                          << "% | " << Utils::formatSize(sent) << " / " << Utils::formatSize(fsize);
+                        << "% | " << Utils::formatSize(sent) << " / " << Utils::formatSize(fsize);
 
                 if (cfg.detailed) {
                     UDT::TRACEINFO tmp;
                     UDT::perfmon(sock, &tmp);
                     std::cout << " | Rate: " << std::fixed << std::setprecision(1)
-                              << tmp.mbpsSendRate << " Mbps";
+                            << tmp.mbpsSendRate << " Mbps";
                 }
                 std::cout << std::flush;
                 last_progress_time = now;
@@ -480,7 +516,7 @@ public:
 
         int hash_sent = 0;
         while (hash_sent < BLAKE3_OUT_LEN) {
-            int s = UDT::send(sock, (char*)hash + hash_sent, BLAKE3_OUT_LEN - hash_sent, 0);
+            int s = UDT::send(sock, (char *) hash + hash_sent, BLAKE3_OUT_LEN - hash_sent, 0);
             if (s == UDT::ERROR) {
                 throw std::runtime_error("Failed to send hash");
             }
@@ -502,7 +538,7 @@ public:
         std::chrono::duration<double> dur = t_end - t_start;
 
         std::cout << "[INFO] Transfer completed in " << std::fixed << std::setprecision(2)
-                  << dur.count() << " seconds" << std::endl;
+                << dur.count() << " seconds" << std::endl;
         std::cout << "[INFO] Waiting for receiver confirmation..." << std::endl;
 
         // 等待接收端确认
@@ -514,13 +550,13 @@ public:
 
         // 接收报告
         char respBuf[16384];
-        int r = UDT::recv(sock, respBuf, sizeof(respBuf)-1, 0);
+        int r = UDT::recv(sock, respBuf, sizeof(respBuf) - 1, 0);
         if (r > 0) {
             respBuf[r] = 0;
             try {
                 json j = json::parse(respBuf);
                 std::cout << "\n=== Receiver Report ===\n" << j.dump(4) << std::endl;
-            } catch (const json::exception& e) {
+            } catch (const json::exception &e) {
                 std::cout << "[INFO] Raw report: " << respBuf << std::endl;
             }
         } else {
@@ -546,7 +582,7 @@ public:
         my_addr.sin_port = htons(cfg.port);
         my_addr.sin_addr.s_addr = INADDR_ANY;
 
-        if (UDT::ERROR == UDT::bind(serv, (sockaddr*)&my_addr, sizeof(my_addr))) {
+        if (UDT::ERROR == UDT::bind(serv, (sockaddr *) &my_addr, sizeof(my_addr))) {
             std::string error = UDT::getlasterror().getErrorMessage();
             throw std::runtime_error("Bind failed: " + error);
         }
@@ -556,7 +592,7 @@ public:
 
         sockaddr_in client_addr;
         int addrlen = sizeof(client_addr);
-        sock = UDT::accept(serv, (sockaddr*)&client_addr, &addrlen);
+        sock = UDT::accept(serv, (sockaddr *) &client_addr, &addrlen);
         if (sock == UDT::ERROR || sock == UDT::INVALID_SOCK) {
             std::string error = UDT::getlasterror().getErrorMessage();
             throw std::runtime_error("Accept failed: " + error);
@@ -566,7 +602,7 @@ public:
 
         // 读取协议头
         ProtocolHeader hdr;
-        int bytes_received = UDT::recv(sock, (char*)&hdr, sizeof(hdr), 0);
+        int bytes_received = UDT::recv(sock, (char *) &hdr, sizeof(hdr), 0);
         if (bytes_received != sizeof(hdr)) {
             throw std::runtime_error("Invalid protocol header received");
         }
@@ -585,7 +621,7 @@ public:
         tuneSocket(sock, rMSS, rWin);
 
         std::cout << "[INFO] Remote config - MSS: " << rMSS << ", Window: "
-                  << Utils::formatSize(rWin) << std::endl;
+                << Utils::formatSize(rWin) << std::endl;
 
         // 读取文件名
         if (nameLen > 65535) {
@@ -601,20 +637,23 @@ public:
         std::string filename = nameBuf.data();
 
         std::cout << "[INFO] Receiving file: " << filename << " ("
-                  << Utils::formatSize(rSize) << ")" << std::endl;
+                << Utils::formatSize(rSize) << ")" << std::endl;
 
-        // 确定保存路径
-        fs::path outPath = cfg.path;
-        try {
-            if (fs::is_directory(outPath)) {
-                outPath /= filename;
-            }
-
-            // 确保目录存在
-            fs::create_directories(outPath.parent_path());
-        } catch (const fs::filesystem_error& e) {
-            throw std::runtime_error("Path error: " + std::string(e.what()));
+#ifdef _WIN32
+        fs::path baseDir = fs::path(Utf8Util::toWide(cfg.path));
+        fs::path outPath = baseDir;
+        if (fs::is_directory(baseDir)) {
+            outPath /= fs::path(Utf8Util::toWide(filename));
         }
+#else
+        fs::path outPath = cfg.path;
+        if (fs::is_directory(outPath)) {
+            outPath /= filenameUtf8;
+        }
+#endif
+
+        // 确保目录存在
+        fs::create_directories(outPath.parent_path());
 
         // 如果文件已存在，添加时间戳后缀
         if (fs::exists(outPath)) {
@@ -636,7 +675,13 @@ public:
         auto t_start = std::chrono::high_resolution_clock::now();
         auto last_progress_time = t_start;
 
-        std::cout << "[INFO] Saving to: " << outPath.filename().string() << std::endl;
+        std::cout << "[INFO] Saving to: " <<
+#ifdef _WIN32
+                Utf8Util::toUtf8(outPath.filename().wstring())
+#else
+                outPath.filename().string()
+#endif
+                << std::endl;
 
         // 接收数据
         while (received < rSize) {
@@ -675,13 +720,13 @@ public:
             if (cfg.detailed || elapsed >= 1000) {
                 double progress = (rSize > 0) ? (static_cast<double>(received) / rSize * 100.0) : 0.0;
                 std::cout << "\r[Progress] " << std::fixed << std::setprecision(1) << progress
-                          << "% | " << Utils::formatSize(received) << " / " << Utils::formatSize(rSize);
+                        << "% | " << Utils::formatSize(received) << " / " << Utils::formatSize(rSize);
 
                 if (cfg.detailed) {
                     UDT::TRACEINFO tmp;
                     UDT::perfmon(sock, &tmp);
                     std::cout << " | Rate: " << std::fixed << std::setprecision(1)
-                              << tmp.mbpsRecvRate << " Mbps";
+                            << tmp.mbpsRecvRate << " Mbps";
                 }
                 std::cout << std::flush;
                 last_progress_time = now;
@@ -693,7 +738,8 @@ public:
         // 检查是否接收到完整文件
         if (received != rSize) {
             // 删除不完整的文件
-            try { fs::remove(outPath); } catch (...) {}
+            try { fs::remove(outPath); } catch (...) {
+            }
             throw std::runtime_error("File transfer incomplete. Expected: " +
                                      Utils::formatSize(rSize) + ", Received: " +
                                      Utils::formatSize(received));
@@ -705,7 +751,7 @@ public:
         uint8_t rHash[BLAKE3_OUT_LEN];
         int hRead = 0;
         while (hRead < BLAKE3_OUT_LEN) {
-            int r = UDT::recv(sock, (char*)rHash + hRead, BLAKE3_OUT_LEN - hRead, 0);
+            int r = UDT::recv(sock, (char *) rHash + hRead, BLAKE3_OUT_LEN - hRead, 0);
             if (r <= 0) {
                 if (r == UDT::ERROR) {
                     std::string error = UDT::getlasterror().getErrorMessage();
@@ -722,7 +768,7 @@ public:
 
         // 等待传输完成标记
         char completeMsg[256];
-        int msgSize = UDT::recv(sock, completeMsg, sizeof(completeMsg)-1, 0);
+        int msgSize = UDT::recv(sock, completeMsg, sizeof(completeMsg) - 1, 0);
         bool transferComplete = false;
         if (msgSize > 0) {
             completeMsg[msgSize] = 0;
@@ -772,7 +818,14 @@ public:
         json jFinal = NetworkStats::analyze(jStats, rMSS, rWin);
 
         jFinal["meta"] = json::object({
-            {"filename", outPath.filename().string()},
+            {
+                "filename",
+#ifdef _WIN32
+                Utf8Util::toUtf8(outPath.filename().wstring())
+#else
+                outPath.filename().string()
+#endif
+            },
             {"filepath", outPath.string()},
             {"filesize", rSize},
             {"filesize_human", Utils::formatSize(rSize)},
@@ -809,20 +862,40 @@ public:
 };
 
 int main(int argc, char* argv[]) {
+
+#ifdef _WIN32
+    // ====== 中文支持新增：控制台 UTF-8 ======
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+
+    // ====== 中文支持新增：从系统获取 UTF-16 命令行并转 UTF-8 ======
+    int wargc = 0;
+    wchar_t** wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+
+    std::vector<std::string> utf8Args;
+    for (int i = 0; i < wargc; ++i) {
+        utf8Args.push_back(Utf8Util::toUtf8(wargv[i]));
+    }
+    LocalFree(wargv);
+
+    std::vector<char*> newArgv;
+    for (auto& s : utf8Args) newArgv.push_back(s.data());
+
+    argc = (int)newArgv.size();
+    argv = newArgv.data();
+#endif
+
     try {
         Config cfg = Config::parse(argc, argv);
         HruftPro app(cfg);
 
-        if (cfg.mode == "send") {
-            app.runSender();
-        } else if (cfg.mode == "recv") {
-            app.runReceiver();
-        }
+        if (cfg.mode == "send") app.runSender();
+        else if (cfg.mode == "recv") app.runReceiver();
 
     } catch (const std::exception& e) {
         std::cerr << "[ERROR] " << e.what() << std::endl;
         return 1;
     }
-
     return 0;
 }
+
