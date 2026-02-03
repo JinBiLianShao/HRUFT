@@ -190,7 +190,6 @@ if (TARGET_TYPE STREQUAL "executable")
         # 根据架构选择对应的静态库路径
         if(COMPILER_TARGET STREQUAL "x86")
             set(BLAKE3_LIB_DIR "${CMAKE_SOURCE_DIR}/lib/win")
-            message(WARNING "No blake3 lib for arch ${COMPILER_TARGET}, skipping blake3 link")
         endif()
 
         if(EXISTS "${BLAKE3_LIB_DIR}")
