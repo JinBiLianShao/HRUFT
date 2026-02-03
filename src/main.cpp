@@ -648,7 +648,7 @@ public:
 #else
         fs::path outPath = cfg.path;
         if (fs::is_directory(outPath)) {
-            outPath /= filenameUtf8;
+            outPath /= filename;
         }
 #endif
 
