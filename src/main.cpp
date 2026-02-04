@@ -22,8 +22,8 @@
 #include <mutex>
 
 #ifdef _WIN32
-#include <windows.h>   // ====== 中文支持新增 ======
 #include <winsock2.h>
+#include <windows.h>   // ====== 中文支持新增 ======
 #include <ws2tcpip.h>
 #pragma comment(lib, "ws2_32.lib")
 #else
@@ -35,6 +35,7 @@
 #include <udt.h>
 #include "blake3.h"
 #include "json.hpp"
+#include "ccc.h"
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
@@ -101,6 +102,62 @@ struct ProtocolHeader {
     // 紧接着是 filename_len 长度的文件名（无终止符）
 };
 #pragma pack(pop)
+
+// --- 简单的拥塞控制类（用于关闭拥塞控制） ---
+class SimpleCC : public CCC {
+public:
+    SimpleCC() {
+        // 设置固定的发送周期和窗口大小，避免拥塞控制调整
+        m_dPktSndPeriod = 1.0; // 最小延迟
+        m_dCWndSize = 1000000.0; // 极大的窗口
+    }
+
+    virtual void init() override {
+        // 保持初始值不变，不进行任何调整
+    }
+
+    virtual void onACK(int32_t) override {
+        // 不调整发送速率
+    }
+
+    virtual void onLoss(const int32_t*, int) override {
+        // 忽略丢包，不调整速率
+    }
+
+    virtual void onTimeout() override {
+        // 忽略超时
+    }
+
+    virtual void onPktSent(const CPacket*) override {
+        // 无操作
+    }
+
+    virtual void onPktReceived(const CPacket*) override {
+        // 无操作
+    }
+
+    virtual void processCustomMsg(const CPacket*) override {
+        // 无操作
+    }
+
+    virtual void close() override {
+        // 无操作
+    }
+};
+
+// 简单的拥塞控制工厂类
+class SimpleCCFactory : public CCCVirtualFactory {
+public:
+    virtual ~SimpleCCFactory() {}
+
+    virtual CCC* create() override {
+        return new SimpleCC;
+    }
+
+    virtual CCCVirtualFactory* clone() override {
+        return new SimpleCCFactory;
+    }
+};
 
 // --- 网络分析工具类 ---
 class NetworkStats {
@@ -221,6 +278,7 @@ struct Config {
     int mss = DEFAULT_MSS;
     int window = DEFAULT_WINDOW;
     bool detailed = false;
+    bool no_cc = false;  // 新增：是否关闭拥塞控制
 
     static Config parse(int argc, char *argv[]) {
         Config c;
@@ -270,6 +328,8 @@ struct Config {
                 }
             } else if (arg == "--detailed") {
                 c.detailed = true;
+            } else if (arg == "--no-cc") {  // 新增：关闭拥塞控制
+                c.no_cc = true;
             } else {
                 throw std::runtime_error("Unknown option: " + arg);
             }
@@ -286,7 +346,8 @@ struct Config {
                 << "  --mss <value>      Maximum Segment Size (default: 1500)\n"
                 << "  --window <value>   Window size in bytes (default: "
                 << DEFAULT_WINDOW / (1024 * 1024) << "MB)\n"
-                << "  --detailed         Show detailed statistics\n";
+                << "  --detailed         Show detailed statistics\n"
+                << "  --no-cc            Disable congestion control (for direct connections)\n";  // 新增
     }
 };
 
@@ -352,13 +413,23 @@ class HruftPro {
         // 1. 设置 MSS (必须在连接前)
         UDT::setsockopt(s, 0, UDT_MSS, &mss, sizeof(int));
 
-        // 2. UDT 缓冲区 (应用层可见窗口)
+        // 2. 如果启用no_cc，设置SimpleCC拥塞控制
+        if (cfg.no_cc) {
+            SimpleCCFactory factory;
+            UDT::setsockopt(s, 0, UDT_CC, &factory, sizeof(SimpleCCFactory));
+
+            // 同时设置一个较大的带宽限制，避免被限制
+            int64_t max_bw = 1000000000; // 1 Gbps
+            UDT::setsockopt(s, 0, UDT_MAXBW, &max_bw, sizeof(int64_t));
+        }
+
+        // 3. UDT 缓冲区 (应用层可见窗口)
         // 限制最大值
         int udtBuf = std::min(winSize, UDT_MAX_BUF);
         UDT::setsockopt(s, 0, UDT_SNDBUF, &udtBuf, sizeof(int));
         UDT::setsockopt(s, 0, UDT_RCVBUF, &udtBuf, sizeof(int));
 
-        // 3. UDP 缓冲区 (操作系统内核级)
+        // 4. UDP 缓冲区 (操作系统内核级)
         int udpBuf = udtBuf;
         if (udpBuf < 1 * 1024 * 1024) {
             udpBuf = 1 * 1024 * 1024; // 最小给 1MB
@@ -367,12 +438,12 @@ class HruftPro {
         UDT::setsockopt(s, 0, UDP_SNDBUF, &udpBuf, sizeof(int));
         UDT::setsockopt(s, 0, UDP_RCVBUF, &udpBuf, sizeof(int));
 
-        // 4. 阻塞模式
+        // 5. 阻塞模式
         bool block = true;
         UDT::setsockopt(s, 0, UDT_SNDSYN, &block, sizeof(bool));
         UDT::setsockopt(s, 0, UDT_RCVSYN, &block, sizeof(bool));
 
-        // 5. 启用地址重用
+        // 6. 启用地址重用
         bool reuse = true;
         UDT::setsockopt(s, 0, UDT_REUSEADDR, &reuse, sizeof(bool));
     }
@@ -835,7 +906,8 @@ public:
             {"remote_hash", remoteHash},
             {"duration_sec", duration},
             {"avg_speed_mbps", duration > 0 ? (rSize * 8.0 / 1000000.0) / duration : 0.0},
-            {"avg_speed_mbs", duration > 0 ? (rSize / (1024.0 * 1024.0)) / duration : 0.0}
+            {"avg_speed_mbs", duration > 0 ? (rSize / (1024.0 * 1024.0)) / duration : 0.0},
+            {"congestion_control_disabled", cfg.no_cc}  // 新增：显示拥塞控制状态
         });
 
         std::string jsonStr = jFinal.dump();
@@ -898,4 +970,3 @@ int main(int argc, char* argv[]) {
     }
     return 0;
 }
-
