@@ -1,243 +1,222 @@
 ####################################################################################################
-# 📘 通用 CMake 构建系统模板说明文档（支持编译可执行文件或库）
-# 作者 ： 连思鑫
-# 本构建系统支持以下功能：
-#   ✅ 自动收集源文件和头文件
-#   ✅ 支持三种构建目标：可执行文件 / 静态库 / 动态库
-#   ✅ 适配多平台交叉编译（x86、arm32、arm64）
-#   ✅ 链接外部静态库（如 SQLite）
-#   ✅ 可选启用 OpenMP 支持
-#   ✅ 编译选项集中管理，易扩展
+# HRUFT Pro - CMake 构建配置
 #
-# 📁 推荐项目目录结构：
-#   project_root/
-#   ├── CMakeLists.txt
-#   ├── src/                # 项目源文件
-#   ├── include/            # 项目头文件
-#   ├── lib/                # 可选本地库
-#   ├── build/              # 构建目录
-#   └── external/           # 第三方库（如 Sqlite）
+# 构建示例：
+#   cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+#   cmake --build build -j
 #
-# 🧩 可配置选项（通过命令行传入）：
-#   -DCOMPILER_TARGET=x86|arm32|arm64             # 目标平台
-#   -DPUBLIC_PACKAGE_DIR=/path/to/packages|NO     # 第三方库路径 / NO表示不引入第三方库路径
-#   -DCMAKE_BUILD_TYPE=Release|Debug              # 构建类型
-#   -DENABLE_OPENMP=ON|OFF                        # 是否启用 OpenMP
-#   -DTARGET_TYPE=executable|static|shared        # 目标类型：可执行 / 静态库 / 动态库
-#   -DTARGET_OS=linux|windows                     # 目标操作系统
-
-# ✅ 构建示例：
-#   mkdir build && cd build
-#   cmake .. -DCOMPILER_TARGET=arm32 -DPUBLIC_PACKAGE_DIR=/home/lsx/PublicPackage -DTARGET_TYPE=static
-#   make -j
-
-# ✅ 跨平台构建示例：
-#   (Linux)   cmake .. -DTARGET_OS=linux -DCOMPILER_TARGET=x86
-#   (Windows) cmake .. -DTARGET_OS=windows
+# 依赖：
+#   - UDT4    ：需自行提供（默认自动探测 ../udt4 或系统安装）
+#   - BLAKE3  ：lib/ 下已附带各平台预编译库
+#   - json.hpp：lib/ 下已附带
 ####################################################################################################
 
-cmake_minimum_required(VERSION 4.1)
+cmake_minimum_required(VERSION 3.16)
 
-# ---------------------------------------------------------------------------------------
-# 1. 项目基础配置
-# ---------------------------------------------------------------------------------------
-if (NOT DEFINED PROJECT_NAME)
-    set(PROJECT_NAME "hruft")
-endif ()
-project(${PROJECT_NAME} LANGUAGES C CXX)
+project(hruft VERSION 4.0.0 LANGUAGES C CXX)
 
-# 设置构建类型 (Debug/Release)
-if (NOT CMAKE_BUILD_TYPE)
-    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
-endif ()
-
-# 强制 C++17 标准
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+if (NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif ()
+
 # ---------------------------------------------------------------------------------------
-# 2. 用户选项目录
+# 1. 构建选项
 # ---------------------------------------------------------------------------------------
 set(TARGET_OS "linux" CACHE STRING "Target OS: linux, windows")
 set(COMPILER_TARGET "x86" CACHE STRING "Target architecture: x86, arm32, arm64")
-set(PUBLIC_PACKAGE_DIR "NO" CACHE PATH "External packages root path or NO")
-set(TARGET_TYPE "executable" CACHE STRING "Build target type: executable | static | shared")
+set(UDT_ROOT "" CACHE PATH "UDT4 source tree or install prefix")
 option(ENABLE_OPENMP "Enable OpenMP parallelism" OFF)
 
-# ---------------------------------------------------------------------------------------
-# 3. 编译器与交叉编译逻辑
-# ---------------------------------------------------------------------------------------
-if (TARGET_OS STREQUAL "windows")
-    # --- Windows 平台配置 ---
-    add_definitions(-D_CRT_SECURE_NO_WARNINGS) # 忽略 MSVC 安全警告
-    message(STATUS "Build Mode: Windows")
-    add_compile_definitions(UDT_STATIC)
-    add_compile_definitions(UDT_EXPORTS)
-    add_compile_definitions(WIN32 UDT_STATIC _CRT_SECURE_NO_WARNINGS)
-    add_compile_options(-static -static-libgcc -static-libstdc++)
-    # 允许编译器进行“宽松”的类型转换（解决 -fpermissive 报错）
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fpermissive")
-
-    # 显式定义 WIN32 宏，防止 UDT 误入 POSIX 分支
-    add_definitions(-DWIN32 -D_WIN32 -D_AMD64_)
-
-    # 如果在 Linux 下使用 MinGW 交叉编译 Windows
-    if (CMAKE_HOST_SYSTEM_NAME MATCHES "Linux")
-        set(CMAKE_SYSTEM_NAME Windows)
-        add_definitions(-DUDT_STATIC)
-        # 在 CMakeLists.txt 中对应的交叉编译逻辑处修改路径
-        set(CMAKE_C_COMPILER "/opt/xpack-mingw-w64-gcc-15.2.0-2/bin/x86_64-w64-mingw32-gcc")
-        set(CMAKE_CXX_COMPILER "/opt/xpack-mingw-w64-gcc-15.2.0-2/bin/x86_64-w64-mingw32-g++")
-    endif()
-
-else()
-    # --- Linux 平台配置 ---
-    message(STATUS "Build Mode: Linux, Target Arch: ${COMPILER_TARGET}")
-
-    if (COMPILER_TARGET STREQUAL "arm64")
-        set(CMAKE_SYSTEM_NAME Linux)
-        set(CMAKE_C_COMPILER "/bin/aarch64-linux-gnu-gcc")
-        set(CMAKE_CXX_COMPILER "/bin/aarch64-linux-gnu-g++")
-
-    elseif (COMPILER_TARGET STREQUAL "arm32")
-        set(CMAKE_SYSTEM_NAME Linux)
-        set(CMAKE_C_COMPILER "arm-linux-gnueabihf-gcc-8")
-        set(CMAKE_CXX_COMPILER "arm-linux-gnueabihf-g++-8")
-        #set(CMAKE_C_COMPILER "/opt/gcc-linaro-7.5.0-2019.12-x86_64_arm-linux-gnueabihf/bin/arm-linux-gnueabihf-gcc")
-        #set(CMAKE_CXX_COMPILER "/opt/gcc-linaro-7.5.0-2019.12-x86_64_arm-linux-gnueabihf/bin/arm-linux-gnueabihf-g++")
-
-    elseif (COMPILER_TARGET STREQUAL "x86")
-        set(CMAKE_C_COMPILER "gcc")
-        set(CMAKE_CXX_COMPILER "g++")
-    endif()
-endif()
-
-# ---------------------------------------------------------------------------------------
-# 4. 自动收集源文件与头文件
-# ---------------------------------------------------------------------------------------
-# 递归搜索 src 和 include 目录（如果存在）
-file(GLOB_RECURSE SRC_FILES
-        "${CMAKE_SOURCE_DIR}/src/*.cpp"
-        "${CMAKE_SOURCE_DIR}/src/*.c"
-        "${CMAKE_SOURCE_DIR}/*.cc"
-        "${CMAKE_SOURCE_DIR}/*.cpp" # 兼容根目录
-)
-
-file(GLOB_RECURSE HEADER_FILES
-        "${CMAKE_SOURCE_DIR}/include/*.h"
-        "${CMAKE_SOURCE_DIR}/include/*.hpp"
-        "${CMAKE_SOURCE_DIR}/*.h"
-)
-
-# 处理外部包路径
-if (NOT PUBLIC_PACKAGE_DIR STREQUAL "NO")
-    file(GLOB_RECURSE EXT_SRC
-            "${PUBLIC_PACKAGE_DIR}/*.cpp"
-            "${PUBLIC_PACKAGE_DIR}/*.cc"
-            "${PUBLIC_PACKAGE_DIR}/*.c"
-    )
-    file(GLOB_RECURSE EXT_HDR
-            "${PUBLIC_PACKAGE_DIR}/*.h"
-            "${PUBLIC_PACKAGE_DIR}/*.hpp"
-    )
-    list(APPEND SRC_FILES ${EXT_SRC})
-    list(APPEND HEADER_FILES ${EXT_HDR})
+if (NOT TARGET_OS STREQUAL "linux" AND NOT TARGET_OS STREQUAL "windows")
+    message(FATAL_ERROR "TARGET_OS must be 'linux' or 'windows', got '${TARGET_OS}'")
+endif ()
+if (NOT COMPILER_TARGET STREQUAL "x86" AND NOT COMPILER_TARGET STREQUAL "arm32" AND NOT COMPILER_TARGET STREQUAL "arm64")
+    message(FATAL_ERROR "COMPILER_TARGET must be x86, arm32 or arm64, got '${COMPILER_TARGET}'")
 endif ()
 
-# 排除编译输出目录
-list(FILTER SRC_FILES EXCLUDE REGEX "${CMAKE_BINARY_DIR}")
-list(FILTER SRC_FILES EXCLUDE REGEX ".*/CMakeFiles/.*")
-list(FILTER SRC_FILES EXCLUDE REGEX "${CMAKE_BINARY_DIR}/.*")
-
-# 自动提取所有头文件所在的目录作为包含路径
-set(INCLUDE_DIRS "")
-foreach (HDR ${HEADER_FILES})
-    get_filename_component(DIR ${HDR} DIRECTORY)
-    list(APPEND INCLUDE_DIRS ${DIR})
-endforeach ()
-list(REMOVE_DUPLICATES INCLUDE_DIRS)
-
 # ---------------------------------------------------------------------------------------
-# 5. 构建目标
+# 2. 交叉编译
+#
+# CMAKE_<LANG>_COMPILER 必须在 project() 之前确定。原配置把它写在 project() 之后，
+# 会被 CMake 静默忽略，导致 -DCOMPILER_TARGET=arm64 实际仍用本机 gcc 编译。
+# 这里在 project() 之后强制改 cache 并重新检查，配合工具链探测给出明确报错。
 # ---------------------------------------------------------------------------------------
-if (TARGET_TYPE STREQUAL "executable")
-    add_executable(${PROJECT_NAME} ${SRC_FILES})
-elseif (TARGET_TYPE STREQUAL "static")
-    add_library(${PROJECT_NAME} STATIC ${SRC_FILES})
-elseif (TARGET_TYPE STREQUAL "shared")
-    add_library(${PROJECT_NAME} SHARED ${SRC_FILES})
+if (COMPILER_TARGET STREQUAL "arm64")
+    set(_hruft_cc "aarch64-linux-gnu-gcc")
+    set(_hruft_cxx "aarch64-linux-gnu-g++")
+    set(_hruft_cross ON)
+elseif (COMPILER_TARGET STREQUAL "arm32")
+    set(_hruft_cc "arm-linux-gnueabihf-gcc")
+    set(_hruft_cxx "arm-linux-gnueabihf-g++")
+    set(_hruft_cross ON)
 else ()
-    message(FATAL_ERROR "Invalid TARGET_TYPE: ${TARGET_TYPE} (must be executable|static|shared)")
+    set(_hruft_cross OFF)
 endif ()
 
-# 绑定头文件目录
-target_include_directories(${PROJECT_NAME} PUBLIC ${INCLUDE_DIRS})
+if (_hruft_cross)
+    find_program(_hruft_cc_path NAMES ${_hruft_cc})
+    find_program(_hruft_cxx_path NAMES ${_hruft_cxx})
+    if (NOT _hruft_cc_path OR NOT _hruft_cxx_path)
+        message(FATAL_ERROR
+                "Cross compiler for ${COMPILER_TARGET} not found (looked for ${_hruft_cc} / ${_hruft_cxx}).\n"
+                "Install it, or build with -DCOMPILER_TARGET=x86.")
+    endif ()
+    if (NOT CMAKE_C_COMPILER MATCHES "${_hruft_cc}")
+        set(CMAKE_C_COMPILER "${_hruft_cc_path}" CACHE FILEPATH "" FORCE)
+        set(CMAKE_CXX_COMPILER "${_hruft_cxx_path}" CACHE FILEPATH "" FORCE)
+        message(FATAL_ERROR
+                "Compiler switched to ${COMPILER_TARGET}. Please re-run cmake in a fresh build directory.")
+    endif ()
+    message(STATUS "Cross-compiling for ${COMPILER_TARGET}")
+endif ()
 
 # ---------------------------------------------------------------------------------------
-# 6. 链接库设置 (区分系统)
+# 3. 依赖：UDT4
 # ---------------------------------------------------------------------------------------
-if (TARGET_TYPE STREQUAL "executable")
-    if (TARGET_OS STREQUAL "windows")
-        # 移除无效的 -static-libblake3
-        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -static-libgcc -static-libstdc++ -static")
-        set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -static-libgcc -static-libstdc++ -static")
+set(UDT_INCLUDE_DIR "")
+set(UDT_SOURCE_DIR "")
 
-        add_definitions(-D_WIN32_WINNT=0x0600)
-        target_link_libraries(${PROJECT_NAME} PRIVATE ws2_32 wsock32 iphlpapi shlwapi)
-
-        # ───── 新增：链接本地 blake3 静态库 ─────
-        # 根据架构选择对应的静态库路径
-        if(COMPILER_TARGET STREQUAL "x86")
-            set(BLAKE3_LIB_DIR "${CMAKE_SOURCE_DIR}/lib/win")
-        endif()
-
-        if(EXISTS "${BLAKE3_LIB_DIR}")
-            target_link_directories(${PROJECT_NAME} PRIVATE "${BLAKE3_LIB_DIR}")
-            target_link_libraries(${PROJECT_NAME} PRIVATE blake3)   # 假设库名为 libblake3.a 或 blake3.lib
-            message(STATUS "Linked blake3 from: ${BLAKE3_LIB_DIR}")
-        else()
-            message(WARNING "blake3 lib directory not found: ${BLAKE3_LIB_DIR}")
-        endif()
-
-    else()
-        # Linux 基础系统库
-        target_link_libraries(${PROJECT_NAME} PRIVATE pthread rt dl m)
-
-        # Linux 下也链接 blake3（如果有）
-        if(COMPILER_TARGET STREQUAL "arm64")
-            set(BLAKE3_LIB_DIR "${CMAKE_SOURCE_DIR}/lib/arm64")
-        elseif(COMPILER_TARGET STREQUAL "arm32")
-            set(BLAKE3_LIB_DIR "${CMAKE_SOURCE_DIR}/lib/arm32")
-        else()
-            set(BLAKE3_LIB_DIR "${CMAKE_SOURCE_DIR}/lib/linux")
-        endif()
-
-        if(EXISTS "${BLAKE3_LIB_DIR}")
-            target_link_directories(${PROJECT_NAME} PRIVATE "${BLAKE3_LIB_DIR}")
-            target_link_libraries(${PROJECT_NAME} PRIVATE blake3)
-        endif()
-    endif()
-endif()
-
-# ---------------------------------------------------------------------------------------
-# 7. OpenMP 支持
-# ---------------------------------------------------------------------------------------
-if (ENABLE_OPENMP)
-    find_package(OpenMP REQUIRED)
-    if (OpenMP_FOUND)
-        message(STATUS "OpenMP support enabled.")
-        target_link_libraries(${PROJECT_NAME} PUBLIC OpenMP::OpenMP_CXX)
+if (UDT_ROOT)
+    if (EXISTS "${UDT_ROOT}/src/udt.h")
+        set(UDT_SOURCE_DIR "${UDT_ROOT}")
+        set(UDT_INCLUDE_DIR "${UDT_ROOT}/src")
+    elseif (EXISTS "${UDT_ROOT}/include/udt/udt.h")
+        set(UDT_INCLUDE_DIR "${UDT_ROOT}/include/udt")
+    elseif (EXISTS "${UDT_ROOT}/udt.h")
+        set(UDT_INCLUDE_DIR "${UDT_ROOT}")
+    else ()
+        message(FATAL_ERROR "UDT_ROOT='${UDT_ROOT}' has no src/udt.h or include/udt/udt.h")
+    endif ()
+else ()
+    foreach (_cand "${CMAKE_CURRENT_SOURCE_DIR}/../udt4" "${CMAKE_CURRENT_SOURCE_DIR}/udt4")
+        if (NOT UDT_INCLUDE_DIR AND EXISTS "${_cand}/src/udt.h")
+            set(UDT_SOURCE_DIR "${_cand}")
+            set(UDT_INCLUDE_DIR "${_cand}/src")
+        endif ()
+    endforeach ()
+    if (NOT UDT_INCLUDE_DIR)
+        find_path(UDT_INCLUDE_DIR udt.h PATHS /usr/include/udt /usr/local/include/udt)
     endif ()
 endif ()
 
+if (NOT UDT_INCLUDE_DIR)
+    message(FATAL_ERROR
+            "UDT4 headers not found.\n"
+            "  git clone https://github.com/JinBiLianShao/udt4.git ../udt4\n"
+            "then re-run cmake (auto-detected), or pass -DUDT_ROOT=/path/to/udt4")
+endif ()
+
+if (NOT EXISTS "${UDT_INCLUDE_DIR}/ccc.h")
+    message(FATAL_ERROR
+            "UDT4 headers at ${UDT_INCLUDE_DIR} are missing ccc.h.\n"
+            "HRUFT needs ccc.h for --no-cc (custom congestion control).\n"
+            "Point -DUDT_ROOT at the UDT4 SOURCE tree, not a binary-only install.")
+endif ()
+
+message(STATUS "UDT4 headers: ${UDT_INCLUDE_DIR}")
+if (UDT_SOURCE_DIR)
+    message(STATUS "UDT4 source:  ${UDT_SOURCE_DIR} (built as subproject)")
+endif ()
+
 # ---------------------------------------------------------------------------------------
-# 8. 编译信息汇总
+# 4. 源文件
+# ---------------------------------------------------------------------------------------
+file(GLOB SRC_FILES CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/*.c")
+if (NOT SRC_FILES)
+    message(FATAL_ERROR "No source files found under src/")
+endif ()
+
+# ---------------------------------------------------------------------------------------
+# 5. 目标
+# ---------------------------------------------------------------------------------------
+add_executable(${PROJECT_NAME} ${SRC_FILES})
+
+target_include_directories(${PROJECT_NAME} PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/lib"
+        "${UDT_INCLUDE_DIR}")
+
+if (TARGET_OS STREQUAL "windows")
+    target_compile_definitions(${PROJECT_NAME} PRIVATE WIN32 _WIN32 _WIN32_WINNT=0x0600 _CRT_SECURE_NO_WARNINGS)
+    target_link_libraries(${PROJECT_NAME} PRIVATE ws2_32 wsock32 iphlpapi shlwapi)
+else ()
+    find_package(Threads REQUIRED)
+    target_link_libraries(${PROJECT_NAME} PRIVATE Threads::Threads rt dl m)
+endif ()
+
+if (MSVC)
+    target_compile_options(${PROJECT_NAME} PRIVATE /W3)
+else ()
+    target_compile_options(${PROJECT_NAME} PRIVATE -Wall -Wextra)
+endif ()
+
+# ---------------------------------------------------------------------------------------
+# 6. UDT4 库
+# ---------------------------------------------------------------------------------------
+if (UDT_SOURCE_DIR)
+    set(UDT_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+    set(UDT_BUILD_STATIC ON CACHE BOOL "" FORCE)
+    add_subdirectory("${UDT_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/udt4" EXCLUDE_FROM_ALL)
+    target_link_libraries(${PROJECT_NAME} PRIVATE udt_static)
+else ()
+    find_library(UDT_LIBRARY NAMES udt udt4 PATHS /usr/lib /usr/local/lib /usr/lib/x86_64-linux-gnu)
+    if (NOT UDT_LIBRARY)
+        message(FATAL_ERROR "UDT4 library not found. Pass -DUDT_ROOT=/path/to/udt4")
+    endif ()
+    message(STATUS "UDT4 library: ${UDT_LIBRARY}")
+    target_link_libraries(${PROJECT_NAME} PRIVATE "${UDT_LIBRARY}")
+endif ()
+
+# ---------------------------------------------------------------------------------------
+# 7. BLAKE3
+# ---------------------------------------------------------------------------------------
+if (TARGET_OS STREQUAL "windows")
+    set(BLAKE3_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/lib/win")
+elseif (COMPILER_TARGET STREQUAL "arm64")
+    set(BLAKE3_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/lib/arm64")
+elseif (COMPILER_TARGET STREQUAL "arm32")
+    set(BLAKE3_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/lib/arm32")
+else ()
+    set(BLAKE3_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/lib/linux")
+endif ()
+
+if (NOT EXISTS "${BLAKE3_LIB_DIR}")
+    message(FATAL_ERROR
+            "No prebuilt BLAKE3 for TARGET_OS=${TARGET_OS} COMPILER_TARGET=${COMPILER_TARGET}.\n"
+            "Expected one of lib/linux, lib/arm32, lib/arm64, lib/win.")
+endif ()
+
+target_link_directories(${PROJECT_NAME} PRIVATE "${BLAKE3_LIB_DIR}")
+target_link_libraries(${PROJECT_NAME} PRIVATE blake3)
+message(STATUS "BLAKE3: ${BLAKE3_LIB_DIR}")
+
+# ---------------------------------------------------------------------------------------
+# 8. OpenMP
+# ---------------------------------------------------------------------------------------
+if (ENABLE_OPENMP)
+    find_package(OpenMP REQUIRED)
+    target_link_libraries(${PROJECT_NAME} PRIVATE OpenMP::OpenMP_CXX)
+    message(STATUS "OpenMP: enabled")
+endif ()
+
+# ---------------------------------------------------------------------------------------
+# 9. 安装
+# ---------------------------------------------------------------------------------------
+include(GNUInstallDirs)
+install(TARGETS ${PROJECT_NAME} RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+# ---------------------------------------------------------------------------------------
+# 10. 汇总
 # ---------------------------------------------------------------------------------------
 message(STATUS "------------------------------------------------")
-message(STATUS " Project Name:   ${PROJECT_NAME}")
-message(STATUS " Target OS:      ${TARGET_OS}")
-message(STATUS " Target Type:    ${TARGET_TYPE}")
-message(STATUS " Build Type:     ${CMAKE_BUILD_TYPE}")
-message(STATUS " Install Dir:    ${CMAKE_INSTALL_PREFIX}")
+message(STATUS " Project:     ${PROJECT_NAME} ${PROJECT_VERSION}")
+message(STATUS " Target OS:   ${TARGET_OS}")
+message(STATUS " Arch:        ${COMPILER_TARGET}")
+message(STATUS " Build type:  ${CMAKE_BUILD_TYPE}")
+message(STATUS " CXX:         ${CMAKE_CXX_COMPILER}")
 message(STATUS "------------------------------------------------")

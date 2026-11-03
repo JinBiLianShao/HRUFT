@@ -1,231 +1,207 @@
-# HRUFT Pro - 高性能可靠UDP文件传输系统（专业版）
+# HRUFT Pro v4.0.0
 
-![Build Status](https://img.shields.io/badge/build-passing-brightgreen)
-![License](https://img.shields.io/badge/license-MIT-blue)
-![C++ Version](https://img.shields.io/badge/C++-17-blue)
+![C++](https://img.shields.io/badge/C%2B%2B-17-blue)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey)
+![License](https://img.shields.io/badge/license-MIT-blue)
 
-HRUFT Pro（High-performance Reliable UDP File Transfer Professional）是一个基于UDT协议的高性能可靠文件传输系统，专为高延迟网络和大文件传输场景设计。**专业版**在流式优化的基础上，采用BLAKE3哈希算法替代MD5，提供更快的哈希计算速度、更强的安全性和更详细网络分析功能。
+基于 UDT4 的可靠 UDP 大文件传输工具。流式 BLAKE3 校验、流水线读写、传输结束后输出 JSON 网络诊断报告。
+
+> **v4.0.0 是破坏性更新**：控制消息改为带长度前缀的定长帧，与 v3.x **不互通**，收发两端必须同时升级。
+
+---
 
 ## ✨ 主要特性
 
-- **BLAKE3流式哈希**：边传输边计算BLAKE3哈希，速度比MD5快10倍以上
-- **高性能传输**：基于UDP的可靠传输，避免TCP在高延迟环境下的性能瓶颈
-- **智能网络分析**：实时分析网络质量，提供优化建议
-- **自适应配置**：支持动态调整MSS和窗口大小以适应不同网络条件
-- **端到端校验**：使用BLAKE3哈希确保文件传输的完整性
-- **详细统计**：提供全面的传输统计和网络分析指标（JSON格式）
-- **跨平台支持**：完美支持Windows和Linux平台
-- **UTF-8中文路径**：完全支持中文文件和目录名
-- **智能EOF检测**：可靠的传输结束信令机制
-- **双向报告**：发送端和接收端交换详细统计报告
+- **分帧协议**：所有控制消息（头/哈希/完成/ACK/报告）都带 4 字节长度前缀，不再依赖「一次 recv 恰好读到一条消息」
+- **三段流水线**：读盘 / BLAKE3 计算 / 网络收发并行，避免三者互相等待
+- **BLAKE3 流式校验**：边传边算，256 位摘要，传输结束双向比对
+- **接收窗口可真正放开**：同时设置 `UDT_FC`（飞行窗口，单位**包**）与 `UDT_RCVBUF`，否则窗口会被 UDT 默认的 25600 包截断
+- **先落 `.part` 再改名**：哈希不通过就删除，磁盘上不会出现损坏文件
+- **路径穿越防护**：对端文件名只保留纯文件名，`../../x`、`/etc/passwd` 一律降级
+- **中文路径**：Windows 走 UTF-8 ↔ UTF-16 全程转换，Linux 直接使用 UTF-8
+- **完整错误检查**：所有 `setsockopt` / `listen` / `recv` / `send` 返回值均检查，失败即报错而非静默继续
+- **不阻塞**：ACK 等待带 30s 超时，对端崩溃不会让发送端永久挂起
+
+---
 
 ## 📦 系统要求
 
 ### 操作系统
 - Windows 7/8/10/11
-- Linux (Ubuntu 18.04+, CentOS 7+, Debian 9+)
+- Linux（Ubuntu 18.04+ / Debian 9+ / CentOS 7+ 等）
 
 ### 编译器
-- GCC 7.0+ (Linux)
-- MinGW-w64 8.0+ 或 Visual Studio 2017+ (Windows)
+- GCC 9+ / Clang 10+（Linux）
+- MinGW-w64 8+ 或 Visual Studio 2017+（Windows）
+- 需要 C++17
 
-### 依赖库
-- UDT库（需要自行导入）
-- BLAKE3库（已集成）
-- nlohmann/json（已集成）
-- 标准C++17库
-- 文件系统库（C++17）
+### 依赖
+
+| 依赖 | 说明 |
+|------|------|
+| **UDT4** | **需自行提供**，见下方「获取 UDT4」 |
+| BLAKE3 | `lib/` 下已附带 linux / arm32 / arm64 / win 四套预编译库 |
+| nlohmann/json | `lib/json.hpp` 已附带（v3.12.0） |
+
+---
 
 ## 🚀 快速开始
 
-### 1. 克隆项目
+### 1. 获取 UDT4
+
 ```bash
-git clone https://github.com/JinBiLianShao/HRUFT-Pro.git
-cd hruft-pro
+git clone https://github.com/JinBiLianShao/udt4.git ../udt4
 ```
 
-### 2. 构建项目
+> **必须是源码树，不能是二进制安装**。HRUFT 的 `--no-cc` 需要 `ccc.h`（自定义拥塞控制），
+> 而该头文件通常不在 `make install` 的产物里。CMake 会自动探测 `../udt4`，也可显式指定：
+> `-DUDT_ROOT=/path/to/udt4`
+
+### 2. 构建
+
 ```bash
-mkdir build
-cd build
-cmake ..
-make -j$(nproc)
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
 ```
 
-### 3. 发送文件
-```bash
-# Linux
-./hruft send <目标IP> <端口> <文件路径> [选项]
+CMake 会自动把 UDT4 作为子项目编译（`ccc.cpp`、`cache.cpp` 缺任一个都会链接失败，子项目方式可避免）。
 
-# Windows
-hruft.exe send <目标IP> <端口> <文件路径> [选项]
+### 3. 发送 / 接收
+
+```bash
+# 发送
+./build/hruft send <目标IP> <端口> <文件路径> [选项]
+
+# 接收（savepath 可以是目录，也可以是完整文件名）
+./build/hruft recv <监听端口> <保存路径> [选项]
 ```
 
-### 4. 接收文件
+---
+
+## 📖 使用指南
+
+### 发送端
+
 ```bash
-# Linux
-./hruft recv <监听端口> <保存路径> [选项]
-
-# Windows
-hruft.exe recv <监听端口> <保存路径> [选项]
+hruft send <ip> <port> <filepath> [options]
 ```
-
-## 📖 详细使用指南
-
-### 发送端命令
-```bash
-hruft send <ip> <port> <filepath> [选项]
-```
-
-**参数说明：**
 
 | 参数 | 描述 | 默认值 | 必填 |
 |------|------|--------|------|
-| `ip` | 目标服务器IP地址 | - | 是 |
-| `port` | 目标端口 | - | 是 |
-| `filepath` | 要发送的文件路径 | - | 是 |
-| `--mss` | 最大分段大小（字节） | 1500 | 否 |
-| `--window` | 传输窗口大小（字节） | 10MB | 否 |
-| `--detailed` | 启用详细统计输出 | false | 否 |
+| `ip` | 目标 IP（仅 IPv4，不支持域名/NAT 穿透） | - | 是 |
+| `port` | 目标端口（1-65535） | - | 是 |
+| `filepath` | 要发送的**普通文件**路径 | - | 是 |
+| `--mss` | 最大分段大小，536-8900 | 1500 | 否 |
+| `--window` | 窗口大小（字节），最小 64KB，上限 256MB | 10MB | 否 |
+| `--detailed` | 每秒输出瞬时速率与网络统计 | false | 否 |
+| `--no-cc` | 关闭拥塞控制（仅限直连链路，见下方警告） | false | 否 |
 
-**示例：**
+### 接收端
+
 ```bash
-# 发送大文件并使用优化参数
-hruft send 192.168.1.100 9000 ./large_file.iso --mss 1500 --window 104857600 --detailed
-
-# 发送包含中文路径的文件
-hruft send 192.168.1.100 9000 ./文档/项目文件.zip
+hruft recv <port> <savepath> [options]
 ```
-
-### 接收端命令
-```bash
-hruft recv <port> <savepath> [选项]
-```
-
-**参数说明：**
 
 | 参数 | 描述 | 默认值 | 必填 |
 |------|------|--------|------|
-| `port` | 监听端口 | - | 是 |
-| `savepath` | 文件保存路径或目录 | - | 是 |
-| `--detailed` | 启用详细统计输出 | false | 否 |
+| `port` | 监听端口（1-65535） | - | 是 |
+| `savepath` | 目录，或完整文件名 | - | 是 |
+| `--mss` | 同发送端。**接收端设置才决定实际 MSS**（见下） | 1500 | 否 |
+| `--window` | 同发送端。**接收端设置才决定实际接收窗口** | 10MB | 否 |
+| `--max-size` | 拒绝大于该字节数的文件 | 不限 | 否 |
+| `--detailed` | 每秒输出瞬时速率与网络统计 | false | 否 |
+| `--no-cc` | 关闭拥塞控制 | false | 否 |
 
-**示例：**
-```bash
-# 接收到指定目录（自动使用发送端文件名）
-hruft recv 9000 ./下载/ --detailed
+### ⚠️ 参数由接收端决定，不是发送端
 
-# 接收到指定文件路径
-hruft recv 9000 ./下载/项目文件.zip
+这一点容易踩坑，务必理解：
+
+- **MSS**：UDT 握手时取双方较小值（`core.cpp: connect()`），所以任一端设小都会生效
+- **接收窗口**：由**接收端**的 `UDT_RCVBUF` / `UDT_FC` 决定，发送端只是把接收端通告的飞行窗口当上限
+
+因此 `hruft send ... --window 128MB` 在接收端仍是默认 10MB 时**毫无效果**。要提速必须两端一起调，
+或干脆只在接收端调大。
+
+---
+
+## 🔄 协议说明（v4）
+
+### 帧格式
+
+```
++----------------+----------+------------------+
+| u32 length (BE) | u8 type  | payload (length-1) |
++----------------+----------+------------------+
 ```
 
-## 🔄 传输流程说明
+`length` 含类型字节本身，上限 64MB。类型：
 
-HRUFT Pro采用完整的握手和确认机制确保可靠传输，基于BLAKE3哈希算法实现流式计算：
+| type | 名称 | payload |
+|------|------|---------|
+| 1 | HEADER | `ProtocolHeader`(24B) + 文件名(UTF-8，无终止符) |
+| 2 | HASH | 32 字节 BLAKE3 摘要 |
+| 3 | DONE | 空 |
+| 4 | ACK | 1 字节状态（0=OK，1=哈希不符，2=中止） |
+| 5 | REPORT | UTF-8 JSON |
 
-### 发送端流程：
-1. **连接建立**：连接到接收端，发送协议头（包含文件大小、MSS、窗口大小等信息）
-2. **流式数据传输**：分块读取文件（4MB块），**边读边算BLAKE3哈希**，同时发送数据
-3. **发送哈希值**：传输完成后发送BLAKE3哈希值（256位）
-4. **发送完成标记**：发送`TRANSFER_COMPLETE`标记
-5. **等待确认**：等待接收端返回确认（`ACK_TRANSFER`）
-6. **接收报告**：接收接收端的详细统计报告
-7. **优雅关闭**：关闭连接
+### 协议头
 
-### 接收端流程：
-1. **监听连接**：监听指定端口等待发送端连接
-2. **接收协议头**：验证魔数，获取文件信息和配置
-3. **流式接收数据**：持续接收数据，**边收边算BLAKE3哈希**，同时写入文件
-4. **接收哈希值**：接收发送端计算的BLAKE3哈希
-5. **接收完成标记**：确认`TRANSFER_COMPLETE`标记
-6. **发送确认**：发送`ACK_TRANSFER`给发送端
-7. **哈希校验**：对比本地计算的哈希和接收到的哈希
-8. **生成报告**：生成包含网络分析的详细JSON报告
-9. **发送报告**：将报告发送给发送端
-10. **确认关闭**：关闭连接
-
-### 协议头结构
 ```cpp
+#pragma pack(push, 1)
 struct ProtocolHeader {
-    uint32_t magic;        // 魔数 HRP2 (0x48525032)
-    uint32_t mss;          // 最大分段大小
-    uint32_t window_size;  // 窗口大小
-    uint64_t file_size;    // 文件大小
-    uint16_t filename_len; // 文件名长度
-    // 紧接着是变长的文件名
-};
+    uint32_t magic;        // 0x48525034 "HRP4"
+    uint16_t version;      // 4
+    uint16_t flags;        // bit0: 发送端启用了 --no-cc
+    uint64_t file_size;
+    uint32_t filename_len;
+    uint32_t reserved;
+};  // 24 字节，大端
+#pragma pack(pop)
 ```
 
-### BLAKE3 vs MD5 性能对比
+### 传输时序
 
-| 特性 | MD5 | BLAKE3 |
-|------|-----|---------|
-| **哈希长度** | 128位 | 256位（可扩展） |
-| **计算速度** | 1×（基准） | **10-20×** 更快 |
-| **安全性** | 已不推荐用于安全用途 | **高安全性** |
-| **并行能力** | 无 | **原生支持多线程** |
-| **内存使用** | 较低 | 极低 |
-| **流式计算** | 支持 | **原生支持流式** |
+```
+发送端                                    接收端
+  |---- HEADER(头+文件名) --------------->|
+  |---- 文件数据（裸字节流，无帧）------->|
+  |---- HASH(32B) ---------------------->|
+  |---- DONE --------------------------->|
+  |<--- ACK(1B) ------------------------|
+  |<--- REPORT(JSON) -------------------|
+```
 
-## 🔧 高级配置
+文件数据本身不加帧（避免每 4MB 多一次小包），长度由 `file_size` 精确界定。
 
-### CMake构建选项
+---
 
-| 选项 | 描述 | 可选值 | 默认值 |
-|------|------|--------|--------|
-| `CMAKE_BUILD_TYPE` | 构建类型 | Release, Debug, RelWithDebInfo | Debug |
-| `HRUFT_ENABLE_OPENMP` | 启用OpenMP并行 | ON, OFF | OFF |
-| `HRUFT_UDT_PATH` | UDT库路径 | 路径字符串 | "" |
+## 🔧 CMake 选项
 
-**构建示例：**
+| 选项 | 说明 | 默认 |
+|------|------|------|
+| `CMAKE_BUILD_TYPE` | `Release` / `Debug` | Release |
+| `UDT_ROOT` | UDT4 源码树或安装前缀 | 自动探测 `../udt4` |
+| `TARGET_OS` | `linux` / `windows` | linux |
+| `COMPILER_TARGET` | `x86` / `arm32` / `arm64` | x86 |
+| `ENABLE_OPENMP` | 启用 OpenMP | OFF |
+
 ```bash
-# Release构建
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
-
-# 指定UDT库路径
-cmake .. -DHRUFT_UDT_PATH=/path/to/udt4/src -DCMAKE_BUILD_TYPE=Release
+# 交叉编译 arm64（需装 aarch64-linux-gnu-gcc/g++）
+cmake -S . -B build-arm64 -DCOMPILER_TARGET=arm64 -DCMAKE_BUILD_TYPE=Release
+cmake --build build-arm64 -j
 ```
 
-### 传输参数调优
+---
 
-1. **MSS（最大分段大小）**
-   - 建议值：536-8900字节
-   - 应根据网络MTU调整，避免IP分片
-   - 局域网环境可用1500，支持巨型帧的网络可用8900
+## 📊 输出报告
 
-2. **窗口大小**
-   - 默认：10MB（10485760字节）
-   - 高延迟网络建议增大窗口
-   - 公式：窗口大小 ≈ 带宽 × RTT
-   - 最大支持256MB
+接收端在传输结束后生成 JSON 报告，同时打印到本地并发回发送端：
 
-3. **应用层块大小**
-   - 固定为4MB（4194304字节）
-   - 优化磁盘I/O和网络传输的平衡
-
-## 📊 统计信息说明
-
-HRUFT Pro提供全面的传输统计和网络分析信息，全部以JSON格式输出。
-
-### 实时进度报告
-```json
-{
-  "type": "progress",
-  "percent": 65.5,
-  "current": 697932185,
-  "total": 1073741824,
-  "speed_mbps": 2873.50
-}
-```
-
-### 完整统计报告（接收端生成）
 ```json
 {
   "meta": {
     "filename": "large_file.iso",
-    "filepath": "/下载/large_file.iso",
+    "filepath": "/data/large_file.iso",
     "filesize": 1073741824,
     "filesize_human": "1.00 GB",
     "status": "success",
@@ -234,448 +210,151 @@ HRUFT Pro提供全面的传输统计和网络分析信息，全部以JSON格式�
     "remote_hash": "a7b...f2e",
     "duration_sec": 42.5,
     "avg_speed_mbps": 201.8,
-    "avg_speed_mbs": 25.2
+    "avg_speed_mbs": 25.2,
+    "congestion_control_disabled": false,
+    "protocol_version": 4
   },
-  "throughput": {
-    "avg_mbps": 201.8,
-    "inst_mbps": 215.3,
-    "est_bandwidth_mbps": 950.0
-  },
-  "latency": {
-    "rtt_ms": 28.5
-  },
+  "throughput": { "avg_mbps": 201.8, "inst_mbps": 215.3, "est_bandwidth_mbps": 950.0 },
+  "latency": { "rtt_ms": 28.5 },
   "reliability": {
-    "pkt_sent": 850234,
-    "pkt_recv": 850200,
-    "pkt_loss_sent": 12,
-    "pkt_loss_recv": 10,
-    "retrans_total": 34,
-    "retrans_ratio": 0.00004
+    "pkt_sent": 850234, "pkt_recv": 850200,
+    "pkt_loss_sent": 12, "pkt_loss_recv": 10,
+    "retrans_total": 34, "retrans_ratio": 0.00004
   },
-  "congestion": {
-    "window_flow": 8192,
-    "window_cong": 8192,
-    "flight_size": 4096
-  },
-  "buffer_health": {
-    "snd_buf_avail_bytes": 16777216,
-    "rcv_buf_avail_bytes": 8388608
-  },
+  "congestion": { "window_flow": 91180, "window_cong": 16, "flight_size": 4096 },
+  "buffer_health": { "snd_buf_avail_bytes": 16777216, "rcv_buf_avail_bytes": 8388608 },
   "analysis": {
     "network_health": "excellent",
     "bdp_bytes_est": 3325000,
-    "advice": [
-      "网络质量：优秀。如果支持巨型帧，可尝试 --mss 8900。"
-    ]
+    "advice": ["网络质量: 优秀。如果支持巨型帧，可尝试 --mss 8900。"]
   }
 }
 ```
 
-### 网络质量评估
-系统会根据统计数据自动评估网络质量并提供建议：
+### 网络质量等级
 
-| 质量等级 | 重传率 | 控制开销 | 说明 |
-|----------|--------|----------|------|
-| **excellent** | < 0.1% | < 10% | 网络状况极佳，传输高效稳定 |
-| **good** | 0.1%-1% | < 20% | 网络状况良好，传输正常 |
-| **suboptimal** | 1%-5% | < 30% | 网络状况一般，可能存在拥塞 |
-| **network_lossy** | > 5% | > 30% | 网络状况较差，建议优化 |
-
-### 智能分析引擎
-系统包含智能分析引擎，提供以下诊断：
-- **带宽时延积（BDP）计算**：评估理论最优窗口大小
-- **缓冲区健康度检查**：检测接收/发送缓冲区状态
-- **瓶颈识别**：识别网络或磁盘瓶颈
-- **优化建议**：基于当前网络状况提供参数调整建议
-
-## 🏗️ 项目结构
-
-```
-hruft-pro/
-├── CMakeLists.txt          # CMake构建配置文件
-├── README.md              # 项目说明文档
-├── main.cpp              # 主程序文件（完整实现）
-├── blake3/               # BLAKE3哈希库（已集成）
-├── json/                 # nlohmann/json库（已集成）
-├── udt4/                 # UDT4网络库（需自行导入）
-└── build/                # 构建目录
-```
-
-### 核心模块说明
-
-#### 1. **网络分析模块** (`NetworkStats`类)
-**功能：**
-- UDT性能数据收集（通过`UDT::perfmon` API）
-- 实时网络质量评估
-- 智能诊断和建议生成
-- 统计数据序列化为JSON格式
-
-**关键方法：**
-- `snapshot()` - 获取UDT性能快照
-- `analyze()` - 分析网络状况并提供建议
-- 自动计算带宽时延积（BDP）
-
-#### 2. **主程序类** (`HruftPro`类)
-**功能：**
-- UDT socket的创建、配置和管理
-- 自适应参数调整（MSS、窗口大小）
-- 可靠数据传输和重传
-- 完整的握手和确认机制
-- UTF-8中文路径支持
-
-**关键方法：**
-- `tuneSocket()` - 配置socket参数
-- `runSender()` - 发送端主逻辑
-- `runReceiver()` - 接收端主逻辑
-
-#### 3. **工具类** (`Utils`类)
-**功能：**
-- 字节序转换宏（64位支持）
-- 哈希字符串格式化
-- 文件大小格式化
-- 确认等待机制
-
-#### 4. **配置解析** (`Config`类)
-**功能：**
-- 命令行参数解析
-- 参数验证和默认值设置
-- 使用帮助信息生成
-
-## 🔍 故障排除和优化
-
-### 常见问题及解决方案
-
-#### 1. **传输速度异常低**
-**可能原因：**
-- 窗口大小设置过小
-- MSS值不合适
-- 网络拥塞或丢包严重
-
-**解决方案：**
-```bash
-# 增大窗口大小
-hruft send 192.168.1.100 9000 file.iso --window 104857600
-
-# 调整MSS值（尝试巨型帧）
-hruft send 192.168.1.100 9000 file.iso --mss 8900
-
-# 启用详细统计查看网络状况
-hruft send 192.168.1.100 9000 file.iso --detailed
-```
-
-#### 2. **连接失败**
-**检查步骤：**
-1. 确认接收端已启动并监听
-2. 检查防火墙设置（Windows防火墙、iptables）
-3. 验证IP地址和端口号
-4. 确认网络连通性（使用ping测试）
-
-#### 3. **哈希校验失败**
-**可能原因：**
-- 网络传输过程中数据损坏
-- 文件在发送端被修改
-- 存储设备错误
-
-**解决方案：**
-1. 检查网络稳定性
-2. 重新传输文件
-3. 验证源文件完整性
-4. 检查磁盘空间和权限
-
-#### 4. **编译错误**
-**常见问题：**
-- UDT库未正确导入
-- 编译器版本过低
-- CMake配置错误
-
-**解决方案：**
-```bash
-# 确保UDT库路径正确
-cmake .. -DHRUFT_UDT_PATH=/path/to/udt4/src
-
-# 升级编译器
-sudo apt-get install g++-9  # Ubuntu
-
-# 检查CMake版本
-cmake --version  # 需要3.10+
-```
-
-### 性能优化建议
-
-#### 对于高延迟网络（卫星、跨国链路）：
-```bash
-# 增大窗口大小以充分利用带宽
-hruft send <ip> <port> <file> --window 209715200  # 200MB窗口
-
-# 使用中等MSS值减少丢包影响
-hruft send <ip> <port> <file> --mss 1024
-```
-
-#### 对于高带宽低延迟网络（局域网）：
-```bash
-# 使用巨型帧提高效率（需要网络支持）
-hruft send <ip> <port> <file> --mss 8900
-
-# 适当增大窗口
-hruft send <ip> <port> <file> --window 104857600  # 100MB窗口
-```
-
-#### 对于不稳定网络（无线、移动网络）：
-```bash
-# 减小MSS以降低丢包影响
-hruft send <ip> <port> <file> --mss 512
-
-# 使用中等窗口大小
-hruft send <ip> <port> <file> --window 52428800  # 50MB窗口
-```
-
-## 🎯 最佳实践
-
-### 1. **批量传输多个文件**
-```bash
-# 发送端脚本示例（Linux）
-for file in /path/to/files/*.iso; do
-    echo "传输: $file"
-    ./hruft send 192.168.1.100 9000 "$file" --detailed
-    sleep 1
-done
-```
-
-### 2. **自动化监控集成**
-HRUFT Pro的JSON输出格式便于与监控系统集成：
-```bash
-# 将统计信息保存到文件
-./hruft send 192.168.1.100 9000 file.iso --detailed 2>&1 | grep -E '^\{"meta":' > stats.json
-```
-
-### 3. **网络质量长期监控**
-```bash
-# 定期测试并记录网络状况
-while true; do
-    timestamp=$(date +%Y%m%d_%H%M%S)
-    ./hruft send 192.168.1.100 9000 test_file.bin --detailed 2>&1 | tee "network_test_${timestamp}.log"
-    sleep 300  # 每5分钟测试一次
-done
-```
-
-## 📊 性能基准测试
-
-### 典型性能指标（基于测试结果）
-
-| 网络类型 | 平均速度 | 重传率 | 推荐配置 |
-|----------|----------|--------|----------|
-| 千兆局域网 | 800-950 Mbps | < 0.01% | MSS=8900, Window=100MB |
-| 百兆局域网 | 90-98 Mbps | < 0.1% | MSS=1500, Window=10MB |
-| 高速互联网 | 50-200 Mbps | 0.1-1% | MSS=1024, Window=50MB |
-| 高延迟卫星 | 10-50 Mbps | 1-5% | MSS=512, Window=20MB |
-
-### **BLAKE3 vs MD5 性能对比**
-| 文件大小 | MD5计算时间 | BLAKE3计算时间 | 性能提升 |
-|----------|-------------|----------------|----------|
-| 100MB | 0.2秒 | **0.02秒** | **10倍** |
-| 1GB | 2秒 | **0.2秒** | **10倍** |
-| 10GB | 20秒 | **2秒** | **10倍** |
-| 100GB | 3-4分钟 | **20秒** | **9-12倍** |
-
-### 测试命令示例
-```bash
-# 创建测试文件（1GB）
-dd if=/dev/zero of=test_1g.bin bs=1M count=1024
-
-# 测试传输性能
-./hruft send 192.168.1.100 9000 test_1g.bin --mss 8900 --window 104857600 --detailed
-```
-
-## 🆕 版本特性（HRUFT Pro）
-
-### 核心优化：
-1. **BLAKE3哈希算法**：替换MD5，速度提升10倍以上
-2. **流式哈希计算**：边传输边计算，零启动延迟
-3. **智能网络分析**：实时诊断网络状况，提供优化建议
-4. **UTF-8中文支持**：完美支持中文路径和文件名
-
-### 技术升级：
-1. **协议结构优化**：使用固定协议头，提高解析效率
-2. **缓冲区优化**：支持高达256MB的窗口大小
-3. **统计信息增强**：提供详细的JSON格式统计报告
-4. **跨平台改进**：Windows/Linux统一代码路径
-
-### 新增特性：
-1. **双向报告交换**：发送端和接收端交换详细统计信息
-2. **智能EOF检测**：可靠的传输结束信令机制
-3. **优雅关闭机制**：双方确认后有序关闭连接
-4. **详细错误报告**：提供更清晰的错误信息和调试输出
-
-## 🤝 贡献指南
-
-### 提交问题
-1. 在GitHub Issues中搜索相关问题
-2. 如未找到，创建新Issue并详细描述问题
-3. 包括以下信息：
-   - 操作系统和版本
-   - 编译器和版本
-   - 详细的复现步骤
-   - 相关日志输出
-
-### 提交代码
-1. Fork项目到个人账户
-2. 创建功能分支：`git checkout -b feature/new-feature`
-3. 提交更改：`git commit -m "描述变更内容"`
-4. 推送到分支：`git push origin feature/new-feature`
-5. 创建Pull Request
-
-### 代码规范
-- 遵循C++17标准
-- 使用有意义的变量名和函数名
-- 添加必要的注释（特别是复杂算法）
-- 保持一致的代码风格
-- 添加单元测试（如果适用）
-
-## 📄 许可证
-
-本项目采用MIT许可证。详见[LICENSE](LICENSE)文件。
-
-## 🙏 致谢
-
-- **UDT项目团队**：提供高性能UDP传输协议基础
-- **BLAKE3团队**：提供快速安全的哈希算法
-- **nlohmann/json作者**：优秀的JSON库
-- **CMake社区**：优秀的跨平台构建系统
-- **开源贡献者**：感谢每一位为项目做出贡献的人
-
-## 📞 联系方式
-
-- **项目维护者**：连思鑫
-- **问题反馈**：[GitHub Issues](https://github.com/JinBiLianShao/HRUFT-Pro/issues)
-- **邮箱**：jinbilianshao@gmail.com
-- **项目地址**：https://github.com/JinBiLianShao/HRUFT-Pro
-
-## 🔄 更新日志
-
-### v3.0.0 (HRUFT Pro)
-- ✅ **BLAKE3哈希**：替换MD5，速度提升10倍
-- ✅ **智能网络分析**：实时诊断网络状况
-- ✅ **UTF-8中文支持**：完美支持中文路径
-- ✅ **JSON统计报告**：详细的双向统计信息
-- ✅ **协议优化**：新的协议头结构，提高效率
-
-### v2.0.0 (流式优化版)
-- ✅ **流式MD5计算**：边传输边计算，消除I/O瓶颈
-- ✅ **协议结构优化**：新增`FileFooterPacket`传输结束包
-- ✅ **启动延迟消除**：无需等待预计算，立即开始传输
-
-### v1.0.0 (基础版)
-- ✅ 完整的传输信令机制
-- ✅ 移除超时限制，支持大文件传输
-- ✅ 改进的EOF标记处理
-- ✅ 双向统计信息同步
-
----
-
-## ⚡ 快速参考表
-
-### 常用命令
-| 命令 | 说明 |
-|------|------|
-| `hruft send <ip> <port> <file> --detailed` | 发送文件并显示详细统计 |
-| `hruft recv <port> <dir/> --detailed` | 接收文件到目录 |
-| `hruft recv <port> <file> --detailed` | 接收文件到指定路径 |
-
-### 优化参数
-| 场景 | 推荐配置 |
+| 等级 | 触发条件 |
 |------|----------|
-| 千兆局域网 | `--mss 8900 --window 100MB` |
-| 高延迟网络 | `--mss 1024 --window 200MB` |
-| 不稳定网络 | `--mss 512 --window 50MB` |
-
-### 关键统计指标
-| 指标 | 理想值 | 说明 |
-|------|--------|------|
-| 重传率 | < 0.1% | 网络状况良好 |
-| RTT | < 50ms | 延迟较低 |
-| 传输效率 | > 95% | 数据传输高效 |
-| 哈希匹配 | true | 数据完整性好 |
-
-### 调试信息
-| 信息类型 | 说明 |
-|----------|------|
-| `{"type":"progress"}` | 实时进度报告 |
-| `{"type":"statistics"}` | 完整统计信息 |
-| `{"type":"meta"}` | 传输元信息 |
+| `excellent` | 重传率 < 0.1% 且无窗口告警 |
+| `good` | 重传率 0.1% - 1% |
+| `suboptimal` | 配置窗口小于 BDP |
+| `network_lossy` | 重传率 > 1% |
+| `unknown` | 统计数据缺失 |
 
 ---
 
-## 💡 使用技巧
+## 🔍 故障排除
 
-1. **首次使用时**：先用小文件测试，确认连接正常
-2. **性能调优**：根据统计信息中的`analysis`部分调整参数
-3. **批量传输**：编写脚本实现自动化批量传输
-4. **监控集成**：利用JSON输出集成到现有监控系统
-5. **网络测试**：使用HRUFT Pro作为网络质量测试工具
+### 编译期
 
-### **专业版使用技巧**
-1. **超大文件传输**：BLAKE3哈希计算几乎无感知，适合TB级文件
-2. **网络诊断**：利用分析报告识别网络瓶颈
-3. **中文环境**：无需担心中文路径问题
-4. **自动化集成**：JSON输出格式便于自动化处理
+**`UDT4 headers not found`**
+→ 没克隆 UDT4，或路径不对。`git clone https://github.com/JinBiLianShao/udt4.git ../udt4`，或 `-DUDT_ROOT=`。
+
+**`missing ccc.h`**
+→ 你指向的是二进制安装目录。`--no-cc` 需要 UDT4 **源码树**里的 `ccc.h`。
+
+**`undefined reference to CCC::CCC()` / `CInfoBlock::getKey()`**
+→ 你用的 UDT4 版本 `CMakeLists.txt` 漏了 `src/ccc.cpp` 和 `src/cache.cpp`。
+  这两个文件分别提供自定义拥塞控制和连接信息缓存，缺任一个都会链接失败。已在上游修复；
+  若用旧版请手动补进 `UDT_SOURCES`。
+
+### 运行期
+
+**传输速度远低于预期**
+1. 先看报告的 `congestion.window_flow`。若它停在 `25600` 左右，说明 `UDT_FC` 没放开——
+   MSS 1500 时这就是约 37MB 的硬上限，`--window` 再大也无效。
+2. 确认 `--window` 是**在接收端**调的。
+3. 高延迟链路：`window` 应 ≥ 带宽 × RTT，否则看 `analysis.advice` 里的 BDP 提示。
+
+**哈希校验失败**
+接收端会删除 `.part` 临时文件并返回非 0，磁盘上不会留下损坏文件。检查链路稳定性后重传。
+
+**接收端报 `Unsafe filename`**
+对端发来的文件名含路径分隔符，已被拒绝。正常 v4 发送端不会触发。
+
+---
+
+## 🏗️ 代码结构
+
+```
+src/main.cpp          主程序（单文件实现）
+  ├─ ProtocolHeader   协议头
+  ├─ Frame I/O        sendFrame / recvFrame / writeFully / readFully
+  ├─ BufferPool       流水线缓冲池
+  ├─ SimpleCC         自定义拥塞控制（--no-cc）
+  ├─ NetworkStats     统计快照与诊断
+  ├─ Config           命令行解析
+  └─ HruftPro         runSender / runReceiver
+lib/                  blake3（四平台）+ json.hpp
+CMakeLists.txt        构建配置
+```
 
 ---
 
 ## ⚠️ 注意事项
 
-1. **网络环境**：本系统专为可控网络环境设计，不适用于需要NAT穿透的场景
-2. **大文件传输**：确保接收端有足够的磁盘空间
-3. **权限问题**：Linux环境下注意文件读写权限
-4. **防火墙**：确保相关端口在防火墙中开放
-5. **内存使用**：大窗口设置会占用较多内存，请根据系统资源调整
-
-### **专业版注意事项**
-1. **BLAKE3哈希**：256位哈希，比MD5更长更安全
-2. **协议兼容**：与旧版本不兼容，需确保发送端和接收端使用相同版本
-3. **网络分析**：分析建议仅供参考，实际网络环境可能更复杂
-4. **性能影响**：网络分析会轻微增加CPU使用率
+1. **仅 IPv4**，不支持域名解析与 NAT 穿透
+2. **明文传输**，无认证无加密。仅用于可信网络，不要暴露在公网
+3. **单连接**：一次只处理一个对端，传完即退出
+4. **`--no-cc` 慎用**：关闭拥塞控制后不会对丢包做退让，在共享链路上会挤占带宽甚至加剧拥塞。
+   仅建议在直连光纤/局域网等无竞争环境使用
+5. **内存占用**：`--window` 越大占用越多，两端各占约 `window × 2`（收发缓冲 + 内核 UDP 缓冲）
 
 ---
 
-## 🎯 **性能对比**
+## 🔄 更新日志
 
-### **HRUFT Pro vs 传统方案**
+### v4.0.0
 
-| 文件大小 | 传统方案 | HRUFT Pro | 优势 |
-|----------|----------|-----------|------|
-| **100MB** | 启动延迟: 0.2秒 | 启动延迟: **0.02秒** | 10倍哈希速度 |
-| **1GB** | 启动延迟: 2秒 | 启动延迟: **0.2秒** | 10倍哈希速度 |
-| **10GB** | 启动延迟: 20秒 | 启动延迟: **2秒** | 10倍哈希速度 |
-| **100GB** | 启动延迟: 3-4分钟 | 启动延迟: **20秒** | **9-12倍优势** |
-| **1TB** | 启动延迟: 30-40分钟 | 启动延迟: **3-4分钟** | **10倍优势** |
+**协议（破坏性）**
+- 控制消息改为 `[u32 len][u8 type][payload]` 定长帧，修复「一次 recv 读到半条消息」导致的 ACK 误判、报告截断、文件名截断
+- 协议头加版本号与 flags，magic 改为 `HRP4`
+- 文件数据段仍为裸字节流，长度由 `file_size` 界定
 
-### **适用场景推荐**
-- ✅ **强烈推荐**：TB级文件传输、需要快速哈希计算的场景
-- ✅ **推荐**：GB级文件传输、中文路径环境、需要网络诊断
-- ⚠️ **可选**：MB级小文件传输、简单传输需求
+**正确性修复**
+- `recv <port> out.bin` 崩溃：`create_directories("")` 抛 `filesystem error`（空 parent 现在会跳过）
+- 接收端在 `accept` 之后调用 `tuneSocket` 必然失败（UDT 此时已 `m_bOpened`），改为在 `bind` 前设置
+- 放开 `UDT_FC`：此前接收窗口被 UDT 默认 25600 包截断，`--window` 超过约 37MB 完全无效
+- 11 处 `setsockopt`、`listen`、`getsockopt` 返回值全部检查，失败即报错
+- ACK 等待加 30s 超时，对端崩溃不再永久挂起
+- 同名文件冲突改为循环加 `(1)(2)...`，不再依赖秒级时间戳（同秒会覆盖）
+- 先写 `.part`，哈希通过才 `rename`；失败则删除
+- 发送前后校验文件大小，避免传输中被修改导致接收端死等
+- 端口与 `--mss` / `--window` / `--max-size` 全部做范围校验（端口 0、70000 此前会被 `htons` 静默截断）
+- 发送目录时给出 `Not a regular file`，不再抛裸 `filesystem error`
 
----
+**安全**
+- 路径穿越防护：对端文件名只保留纯文件名，`../../evil.sh` → `evil.sh`，`/etc/passwd` → `passwd`
+- 新增 `--max-size`，限制接收文件大小
 
-**重要提示**：对于超大规模文件传输（>100GB），HRUFT Pro的BLAKE3哈希计算可以节省大量时间。
+**性能**
+- 三段流水线：读盘 / BLAKE3 / 网络收发并行（`PIPELINE_DEPTH = 4` 块）
+- 进度显示不再阻塞主传输路径
 
-**性能提示**：传输速度受限于网络带宽、延迟、丢包率和两端系统性能，BLAKE3哈希计算几乎不影响网络传输速度。
+**工程**
+- `CMakeLists.txt` 重写：UDT 自动探测、缺 `ccc.h` 明确报错、交叉编译真正生效（原配置在 `project()` 之后设编译器，被 CMake 静默忽略）
+- 默认开启 `-Wall -Wextra`，当前零警告
+- `GLOB` 加 `CONFIGURE_DEPENDS`，新增源文件不再需要手动重配
+- 移除未使用的 `--detailed` 之外的所有死代码
 
----
+### v3.0.0
+- BLAKE3 替代 MD5
+- 流式计算，超大文件不再二次读盘
 
-⭐ **如果这个项目对你有帮助，请给它一个Star！** ⭐
+### v2.0.0
+- 流式传输优化
 
-📢 **欢迎提交Issue和Pull Request，共同改进HRUFT Pro！**
+### v1.0.0
+- 基础 UDT 文件传输
 
 ---
 
 ## 🔗 相关资源
 
-- [UDT官方文档](http://udt.sourceforge.net/)
-- [BLAKE3官方仓库](https://github.com/BLAKE3-team/BLAKE3)
-- [CMake官方文档](https://cmake.org/documentation/)
-- [nlohmann/json文档](https://json.nlohmann.me/)
+- [UDT4（本项目使用）](https://github.com/JinBiLianShao/udt4)
+- [BLAKE3](https://github.com/BLAKE3-team/BLAKE3)
+- [nlohmann/json](https://json.nlohmann.me/)
 
----
+## 📄 许可证
 
-**版本状态**：✅ 生产就绪 | **哈希算法**：✅ BLAKE3 | **网络分析**：✅ 智能诊断
-**性能提升**：✅ 10倍哈希速度 | **中文支持**：✅ UTF-8完整支持
+MIT
