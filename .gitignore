@@ -1,0 +1,22 @@
+# 构建产物
+build/
+cmake-build-*/
+*.o
+*.a
+*.so
+*.exe
+hruft
+
+# IDE
+.idea/
+.vscode/
+*.user
+*.swp
+
+# 测试临时产物
+tests/**/work/
+*.part
+
+# 系统
+.DS_Store
+Thumbs.db

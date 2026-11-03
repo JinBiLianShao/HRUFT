@@ -1,61 +1,54 @@
-# HRUFT Pro v4.0.0
+# HRUFT Pro
+
+基于 UDT4 的可靠 UDP 大文件传输工具。流式 BLAKE3 校验，传输结束输出 JSON 网络诊断报告。
+
+作者：连思鑫
 
 ![C++](https://img.shields.io/badge/C%2B%2B-17-blue)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey)
 ![License](https://img.shields.io/badge/license-MIT-blue)
-
-基于 UDT4 的可靠 UDP 大文件传输工具。流式 BLAKE3 校验、流水线读写、传输结束后输出 JSON 网络诊断报告。
-
-> **v4.0.0 是破坏性更新**：控制消息改为带长度前缀的定长帧，与 v3.x **不互通**，收发两端必须同时升级。
+![Version](https://img.shields.io/badge/version-4.0.0-green)
 
 ---
 
-## ✨ 主要特性
+## 为什么写这个
 
-- **分帧协议**：所有控制消息（头/哈希/完成/ACK/报告）都带 4 字节长度前缀，不再依赖「一次 recv 恰好读到一条消息」
-- **三段流水线**：读盘 / BLAKE3 计算 / 网络收发并行，避免三者互相等待
-- **BLAKE3 流式校验**：边传边算，256 位摘要，传输结束双向比对
-- **接收窗口可真正放开**：同时设置 `UDT_FC`（飞行窗口，单位**包**）与 `UDT_RCVBUF`，否则窗口会被 UDT 默认的 25600 包截断
-- **先落 `.part` 再改名**：哈希不通过就删除，磁盘上不会出现损坏文件
-- **路径穿越防护**：对端文件名只保留纯文件名，`../../x`、`/etc/passwd` 一律降级
-- **中文路径**：Windows 走 UTF-8 ↔ UTF-16 全程转换，Linux 直接使用 UTF-8
-- **完整错误检查**：所有 `setsockopt` / `listen` / `recv` / `send` 返回值均检查，失败即报错而非静默继续
-- **不阻塞**：ACK 等待带 30s 超时，对端崩溃不会让发送端永久挂起
+用普通 TCP 传大文件，跨运营商或者出国链路一丢包速度就塌到几百 KB/s，
+等一个 100GB 的包要一整天。换成基于 UDP 的 UDT 之后同样的链路能跑满带宽，
+于是有了这个工具。
+
+它做的事很单一：把一台机器上的一个文件，尽可能快地、确定地送到另一台机器上，
+并且能证明送过去的内容和源文件一个字节都不差。
 
 ---
 
-## 📦 系统要求
+## 特性
 
-### 操作系统
-- Windows 7/8/10/11
-- Linux（Ubuntu 18.04+ / Debian 9+ / CentOS 7+ 等）
-
-### 编译器
-- GCC 9+ / Clang 10+（Linux）
-- MinGW-w64 8+ 或 Visual Studio 2017+（Windows）
-- 需要 C++17
-
-### 依赖
-
-| 依赖 | 说明 |
-|------|------|
-| **UDT4** | **需自行提供**，见下方「获取 UDT4」 |
-| BLAKE3 | `lib/` 下已附带 linux / arm32 / arm64 / win 四套预编译库 |
-| nlohmann/json | `lib/json.hpp` 已附带（v3.12.0） |
+- **BLAKE3 流式校验**：边传边算，不二次读盘。传输结束后收发两端比对 256 位摘要
+- **分帧协议**：控制消息带长度前缀，不依赖「一次 recv 恰好读到一条消息」这种不成立的假设
+- **三段流水线**：读盘 / BLAKE3 / 网络收发并行
+- **先落 `.part` 再改名**：哈希不过就删掉，磁盘上不会出现损坏文件
+- **路径穿越防护**：对端文件名只保留纯文件名，`../../x` 一律降级
+- **中文路径**：Windows 走 UTF-8 ↔ UTF-16 全程转换
+- **参数全检查**：所有 `setsockopt` / `listen` / `recv` / `send` 返回值都看，失败即报错
+- **不会无限挂起**：ACK 等待带 30 秒超时
 
 ---
 
-## 🚀 快速开始
+## 快速开始
 
-### 1. 获取 UDT4
+### 1. 准备 UDT4
 
 ```bash
 git clone https://github.com/JinBiLianShao/udt4.git ../udt4
 ```
 
-> **必须是源码树，不能是二进制安装**。HRUFT 的 `--no-cc` 需要 `ccc.h`（自定义拥塞控制），
-> 而该头文件通常不在 `make install` 的产物里。CMake 会自动探测 `../udt4`，也可显式指定：
-> `-DUDT_ROOT=/path/to/udt4`
+必须是**源码树**，不能是二进制安装。`--no-cc` 需要源码里的 `ccc.h`，
+而它通常不在 `make install` 的产物里。CMake 会自动探测 `../udt4`，也可以显式指定：
+
+```bash
+cmake -S . -B build -DUDT_ROOT=/path/to/udt4
+```
 
 ### 2. 构建
 
@@ -64,21 +57,23 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 ```
 
-CMake 会自动把 UDT4 作为子项目编译（`ccc.cpp`、`cache.cpp` 缺任一个都会链接失败，子项目方式可避免）。
+CMake 会把 UDT4 当子项目一起编译。这样能避免一个坑：有些 UDT4 版本的
+`CMakeLists.txt` 漏了 `ccc.cpp` 和 `cache.cpp`，用预编译库会链接失败
+（`undefined reference to CCC::CCC()` / `CInfoBlock::getKey()`）。
 
-### 3. 发送 / 接收
+### 3. 传文件
 
 ```bash
-# 发送
-./build/hruft send <目标IP> <端口> <文件路径> [选项]
+# 接收端先起
+./build/hruft recv 9000 ./downloads/
 
-# 接收（savepath 可以是目录，也可以是完整文件名）
-./build/hruft recv <监听端口> <保存路径> [选项]
+# 发送端
+./build/hruft send 192.168.1.100 9000 ./big.iso
 ```
 
 ---
 
-## 📖 使用指南
+## 参数
 
 ### 发送端
 
@@ -86,15 +81,15 @@ CMake 会自动把 UDT4 作为子项目编译（`ccc.cpp`、`cache.cpp` 缺任�
 hruft send <ip> <port> <filepath> [options]
 ```
 
-| 参数 | 描述 | 默认值 | 必填 |
-|------|------|--------|------|
-| `ip` | 目标 IP（仅 IPv4，不支持域名/NAT 穿透） | - | 是 |
-| `port` | 目标端口（1-65535） | - | 是 |
-| `filepath` | 要发送的**普通文件**路径 | - | 是 |
-| `--mss` | 最大分段大小，536-8900 | 1500 | 否 |
-| `--window` | 窗口大小（字节），最小 64KB，上限 256MB | 10MB | 否 |
-| `--detailed` | 每秒输出瞬时速率与网络统计 | false | 否 |
-| `--no-cc` | 关闭拥塞控制（仅限直连链路，见下方警告） | false | 否 |
+| 参数 | 说明 | 默认 |
+|------|------|------|
+| `ip` | 目标 IP（仅 IPv4，不支持域名/NAT 穿透） | 必填 |
+| `port` | 目标端口，1-65535 | 必填 |
+| `filepath` | 要发送的普通文件 | 必填 |
+| `--mss` | 最大分段大小，536-8900 | 1500 |
+| `--window` | 窗口大小（字节），最小 64KB，上限 256MB | 10MB |
+| `--detailed` | 每秒输出瞬时速率 | 关 |
+| `--no-cc` | 关闭拥塞控制（仅直连链路） | 关 |
 
 ### 接收端
 
@@ -102,44 +97,79 @@ hruft send <ip> <port> <filepath> [options]
 hruft recv <port> <savepath> [options]
 ```
 
-| 参数 | 描述 | 默认值 | 必填 |
-|------|------|--------|------|
-| `port` | 监听端口（1-65535） | - | 是 |
-| `savepath` | 目录，或完整文件名 | - | 是 |
-| `--mss` | 同发送端。**接收端设置才决定实际 MSS**（见下） | 1500 | 否 |
-| `--window` | 同发送端。**接收端设置才决定实际接收窗口** | 10MB | 否 |
-| `--max-size` | 拒绝大于该字节数的文件 | 不限 | 否 |
-| `--detailed` | 每秒输出瞬时速率与网络统计 | false | 否 |
-| `--no-cc` | 关闭拥塞控制 | false | 否 |
-
-### ⚠️ 参数由接收端决定，不是发送端
-
-这一点容易踩坑，务必理解：
-
-- **MSS**：UDT 握手时取双方较小值（`core.cpp: connect()`），所以任一端设小都会生效
-- **接收窗口**：由**接收端**的 `UDT_RCVBUF` / `UDT_FC` 决定，发送端只是把接收端通告的飞行窗口当上限
-
-因此 `hruft send ... --window 128MB` 在接收端仍是默认 10MB 时**毫无效果**。要提速必须两端一起调，
-或干脆只在接收端调大。
+| 参数 | 说明 | 默认 |
+|------|------|------|
+| `port` | 监听端口，1-65535 | 必填 |
+| `savepath` | 目录，或完整文件名 | 必填 |
+| `--mss` | 同发送端 | 1500 |
+| `--window` | 同发送端 | 10MB |
+| `--max-size` | 拒绝大于该字节数的文件 | 不限 |
+| `--detailed` | 每秒输出瞬时速率 | 关 |
+| `--no-cc` | 关闭拥塞控制 | 关 |
 
 ---
 
-## 🔄 协议说明（v4）
+## 调参：先说结论
+
+### MSS 是影响最大的参数，而且必须两端一致
+
+实测 512MB 传输：
+
+| MSS | 包数 | 吞吐 |
+|-----|------|------|
+| 1500 | 368773 | 378 MB/s |
+| 8900 | 60677 | **618 MB/s** |
+
+包数降到 1/6，吞吐提升 63%。原因是 UDT 的每包开销是固定的，
+吞吐基本被包数卡住。
+
+> **必须两端给同一个值。** 我试过让发送端不设 MSS 靠 UDT 自己协商，
+> 结果 UDT 取双方较小值，接收端 FC 按 8900 算包数、发送端却按 1500 发，
+> 窗口严重失配，512MB 从 370 MB/s 掉到 **9.2 MB/s**。
+> 功能测试第 15 条专门守这个，见 `tests/README.md`。
+
+MSS 上限就是 8900，再大传输直接失败（实测 12000 / 16000 / 32768 / 65535 全部不行）。
+
+### 窗口：接收端设才有用
+
+UDT 的接收窗口由**接收端**决定，发送端只是把对方通告的窗口当上限。
+所以 `send --window 128MB` 在接收端还是默认 10MB 时**毫无效果**。
+
+另外窗口不是越大越好。要让 `--window` 真正生效，程序内部必须同时设 `UDT_FC`
+（飞行窗口，单位是**包**）——UDT 默认 FC 只有 25600 包，MSS 1500 时相当于
+37MB 硬上限，`--window` 给多大都会被截断到这儿。本程序已经处理了。
+
+实测流水线深度 4 / 8 / 16 对吞吐没有可见影响（564 / 569 / 561 MB/s），
+所以固定 4 块，不再加深。
+
+### `--no-cc` 能提多少
+
+直连链路上实测从 125 提到 236 MB/s（128MB 文件）。因为不存在中间链路拥塞，
+UDT 默认的慢启动和丢包退让纯属拖后腿。
+
+> 但共享链路上不要用。关掉拥塞控制意味着丢包时不会退让，
+> 会挤占别人的带宽，也可能让整条链路更堵。
+
+---
+
+## 协议（v4）
+
+> v4 与 v3 **不互通**，收发两端必须一起升级。
 
 ### 帧格式
 
 ```
-+----------------+----------+------------------+
-| u32 length (BE) | u8 type  | payload (length-1) |
-+----------------+----------+------------------+
++-----------------+----------+--------------------+
+| u32 长度 (大端)  | u8 类型  | payload (长度-1)    |
++-----------------+----------+--------------------+
 ```
 
-`length` 含类型字节本身，上限 64MB。类型：
+长度字段把类型字节也算进去，上限 64MB。
 
-| type | 名称 | payload |
+| 类型 | 名称 | payload |
 |------|------|---------|
-| 1 | HEADER | `ProtocolHeader`(24B) + 文件名(UTF-8，无终止符) |
-| 2 | HASH | 32 字节 BLAKE3 摘要 |
+| 1 | HEADER | `ProtocolHeader`(24B) + 文件名(UTF-8) |
+| 2 | HASH | 32 字节 BLAKE3 |
 | 3 | DONE | 空 |
 | 4 | ACK | 1 字节状态（0=OK，1=哈希不符，2=中止） |
 | 5 | REPORT | UTF-8 JSON |
@@ -159,7 +189,7 @@ struct ProtocolHeader {
 #pragma pack(pop)
 ```
 
-### 传输时序
+### 时序
 
 ```
 发送端                                    接收端
@@ -171,11 +201,11 @@ struct ProtocolHeader {
   |<--- REPORT(JSON) -------------------|
 ```
 
-文件数据本身不加帧（避免每 4MB 多一次小包），长度由 `file_size` 精确界定。
+文件数据不加帧，长度由 `file_size` 精确界定——给每 4MB 套一层帧头纯属浪费。
 
 ---
 
-## 🔧 CMake 选项
+## CMake 选项
 
 | 选项 | 说明 | 默认 |
 |------|------|------|
@@ -186,22 +216,22 @@ struct ProtocolHeader {
 | `ENABLE_OPENMP` | 启用 OpenMP | OFF |
 
 ```bash
-# 交叉编译 arm64（需装 aarch64-linux-gnu-gcc/g++）
+# 交叉编译 arm64
 cmake -S . -B build-arm64 -DCOMPILER_TARGET=arm64 -DCMAKE_BUILD_TYPE=Release
 cmake --build build-arm64 -j
 ```
 
 ---
 
-## 📊 输出报告
+## 输出报告
 
-接收端在传输结束后生成 JSON 报告，同时打印到本地并发回发送端：
+接收端传完会生成 JSON，本地打印并发回发送端：
 
 ```json
 {
   "meta": {
-    "filename": "large_file.iso",
-    "filepath": "/data/large_file.iso",
+    "filename": "big.iso",
+    "filepath": "/data/big.iso",
     "filesize": 1073741824,
     "filesize_human": "1.00 GB",
     "status": "success",
@@ -233,9 +263,9 @@ cmake --build build-arm64 -j
 
 ### 网络质量等级
 
-| 等级 | 触发条件 |
-|------|----------|
-| `excellent` | 重传率 < 0.1% 且无窗口告警 |
+| 等级 | 条件 |
+|------|------|
+| `excellent` | 重传率 < 0.1%，且无窗口告警 |
 | `good` | 重传率 0.1% - 1% |
 | `suboptimal` | 配置窗口小于 BDP |
 | `network_lossy` | 重传率 > 1% |
@@ -243,103 +273,100 @@ cmake --build build-arm64 -j
 
 ---
 
-## 🔍 故障排除
+## 测试
+
+```bash
+# 全部测试（约 2 分钟）
+./tests/run_all.sh
+
+# 性能基准
+HRUFT_BIN=./build/hruft ./tests/performance/bench.sh
+```
+
+目前 73 个用例：功能 23、安全 23、健壮性 27。
+测试说明和实测数据在 [`tests/README.md`](tests/README.md)。
+
+---
+
+## 故障排除
 
 ### 编译期
 
 **`UDT4 headers not found`**
-→ 没克隆 UDT4，或路径不对。`git clone https://github.com/JinBiLianShao/udt4.git ../udt4`，或 `-DUDT_ROOT=`。
+没克隆 UDT4 或路径不对。`git clone https://github.com/JinBiLianShao/udt4.git ../udt4`。
 
 **`missing ccc.h`**
-→ 你指向的是二进制安装目录。`--no-cc` 需要 UDT4 **源码树**里的 `ccc.h`。
+你指向的是二进制安装目录。`--no-cc` 需要源码树里的 `ccc.h`。
 
 **`undefined reference to CCC::CCC()` / `CInfoBlock::getKey()`**
-→ 你用的 UDT4 版本 `CMakeLists.txt` 漏了 `src/ccc.cpp` 和 `src/cache.cpp`。
-  这两个文件分别提供自定义拥塞控制和连接信息缓存，缺任一个都会链接失败。已在上游修复；
-  若用旧版请手动补进 `UDT_SOURCES`。
+UDT4 的 `CMakeLists.txt` 漏了 `src/ccc.cpp` 和 `src/cache.cpp`。补进 `UDT_SOURCES`。
 
 ### 运行期
 
-**传输速度远低于预期**
-1. 先看报告的 `congestion.window_flow`。若它停在 `25600` 左右，说明 `UDT_FC` 没放开——
-   MSS 1500 时这就是约 37MB 的硬上限，`--window` 再大也无效。
-2. 确认 `--window` 是**在接收端**调的。
-3. 高延迟链路：`window` 应 ≥ 带宽 × RTT，否则看 `analysis.advice` 里的 BDP 提示。
+**速度远低于预期**
+1. 看报告里 `congestion.window_flow`。如果停在 25600 附近，说明 `UDT_FC` 没放开
+2. 确认 `--window` 是在**接收端**调的
+3. 试试 `--mss 8900`，**两端都加**
+4. 直连链路可以试 `--no-cc`
 
 **哈希校验失败**
-接收端会删除 `.part` 临时文件并返回非 0，磁盘上不会留下损坏文件。检查链路稳定性后重传。
+接收端会删掉 `.part`，返回非 0。检查链路稳定性后重传。
 
 **接收端报 `Unsafe filename`**
-对端发来的文件名含路径分隔符，已被拒绝。正常 v4 发送端不会触发。
+对端文件名含路径分隔符，已被拒绝。正常 v4 发送端不会触发。
 
 ---
 
-## 🏗️ 代码结构
+## 已知限制
 
-```
-src/main.cpp          主程序（单文件实现）
-  ├─ ProtocolHeader   协议头
-  ├─ Frame I/O        sendFrame / recvFrame / writeFully / readFully
-  ├─ BufferPool       流水线缓冲池
-  ├─ SimpleCC         自定义拥塞控制（--no-cc）
-  ├─ NetworkStats     统计快照与诊断
-  ├─ Config           命令行解析
-  └─ HruftPro         runSender / runReceiver
-lib/                  blake3（四平台）+ json.hpp
-CMakeLists.txt        构建配置
-```
+- **仅 IPv4**，不支持域名解析和 NAT 穿透
+- **明文传输**，无认证无加密，仅用于可信网络
+- **单连接**：一次处理一个对端，传完退出
+- **`--no-cc` 慎用**：共享链路上会挤占带宽
+- **内存占用**约 `window × 2`（收发缓冲 + 内核 UDP 缓冲）
+- **Windows 分支未经实机验证**：代码写了，但开发机没有 Windows 环境
 
 ---
 
-## ⚠️ 注意事项
-
-1. **仅 IPv4**，不支持域名解析与 NAT 穿透
-2. **明文传输**，无认证无加密。仅用于可信网络，不要暴露在公网
-3. **单连接**：一次只处理一个对端，传完即退出
-4. **`--no-cc` 慎用**：关闭拥塞控制后不会对丢包做退让，在共享链路上会挤占带宽甚至加剧拥塞。
-   仅建议在直连光纤/局域网等无竞争环境使用
-5. **内存占用**：`--window` 越大占用越多，两端各占约 `window × 2`（收发缓冲 + 内核 UDP 缓冲）
-
----
-
-## 🔄 更新日志
+## 更新日志
 
 ### v4.0.0
 
 **协议（破坏性）**
-- 控制消息改为 `[u32 len][u8 type][payload]` 定长帧，修复「一次 recv 读到半条消息」导致的 ACK 误判、报告截断、文件名截断
+- 控制消息改为 `[u32 len][u8 type][payload]` 定长帧
+- 修复「一次 recv 读到半条消息」导致的 ACK 误判、报告截断、文件名截断
 - 协议头加版本号与 flags，magic 改为 `HRP4`
-- 文件数据段仍为裸字节流，长度由 `file_size` 界定
 
-**正确性修复**
-- `recv <port> out.bin` 崩溃：`create_directories("")` 抛 `filesystem error`（空 parent 现在会跳过）
-- 接收端在 `accept` 之后调用 `tuneSocket` 必然失败（UDT 此时已 `m_bOpened`），改为在 `bind` 前设置
-- 放开 `UDT_FC`：此前接收窗口被 UDT 默认 25600 包截断，`--window` 超过约 37MB 完全无效
-- 11 处 `setsockopt`、`listen`、`getsockopt` 返回值全部检查，失败即报错
-- ACK 等待加 30s 超时，对端崩溃不再永久挂起
-- 同名文件冲突改为循环加 `(1)(2)...`，不再依赖秒级时间戳（同秒会覆盖）
-- 先写 `.part`，哈希通过才 `rename`；失败则删除
-- 发送前后校验文件大小，避免传输中被修改导致接收端死等
-- 端口与 `--mss` / `--window` / `--max-size` 全部做范围校验（端口 0、70000 此前会被 `htons` 静默截断）
-- 发送目录时给出 `Not a regular file`，不再抛裸 `filesystem error`
+**正确性**
+- 修复 `recv <port> out.bin` 崩溃（`create_directories("")` 抛异常）
+- 修复接收端在 `accept` 后调 `tuneSocket` 必然失败（UDT 已 `m_bOpened`）
+- 放开 `UDT_FC`：此前接收窗口被默认 25600 包截断，`--window` 超 37MB 无效
+- 所有 `setsockopt` / `listen` / `getsockopt` 返回值检查
+- ACK 等待加 30s 超时
+- 同名冲突改循环编号，不再依赖秒级时间戳
+- 先写 `.part` 校验通过再 `rename`
+- 发送前后校验文件大小，防止传输中被修改
+- 端口 / MSS / 窗口 / max-size 全部范围校验
+- 发送目录给出明确错误，不再抛裸 `filesystem error`
 
 **安全**
-- 路径穿越防护：对端文件名只保留纯文件名，`../../evil.sh` → `evil.sh`，`/etc/passwd` → `passwd`
-- 新增 `--max-size`，限制接收文件大小
+- 路径穿越防护：对端文件名只保留纯文件名
+- 文件名 NUL 字节与非法 UTF-8 检查
+- 新增 `--max-size`
 
 **性能**
-- 三段流水线：读盘 / BLAKE3 / 网络收发并行（`PIPELINE_DEPTH = 4` 块）
-- 进度显示不再阻塞主传输路径
+- 三段流水线：读盘 / BLAKE3 / 网络收发并行
+- `UDT_FC` 与 `UDT_RCVBUF` 配合设置，大窗口真正生效
+- 进度显示不阻塞主传输路径
 
 **工程**
-- `CMakeLists.txt` 重写：UDT 自动探测、缺 `ccc.h` 明确报错、交叉编译真正生效（原配置在 `project()` 之后设编译器，被 CMake 静默忽略）
-- 默认开启 `-Wall -Wextra`，当前零警告
-- `GLOB` 加 `CONFIGURE_DEPENDS`，新增源文件不再需要手动重配
-- 移除未使用的 `--detailed` 之外的所有死代码
+- 新增测试套件：功能 23 + 安全 23 + 健壮性 27，共 73 个用例
+- `CMakeLists.txt` 重写：UDT 自动探测、缺 `ccc.h` 明确报错、交叉编译真正生效
+- 默认 `-Wall -Wextra`，当前零警告
+- 源码注释重写，记录每个决策的原因和踩过的坑
 
 ### v3.0.0
-- BLAKE3 替代 MD5
-- 流式计算，超大文件不再二次读盘
+- BLAKE3 替代 MD5，流式计算
 
 ### v2.0.0
 - 流式传输优化
@@ -349,12 +376,12 @@ CMakeLists.txt        构建配置
 
 ---
 
-## 🔗 相关资源
+## 许可证
+
+MIT
+
+## 相关
 
 - [UDT4（本项目使用）](https://github.com/JinBiLianShao/udt4)
 - [BLAKE3](https://github.com/BLAKE3-team/BLAKE3)
 - [nlohmann/json](https://json.nlohmann.me/)
-
-## 📄 许可证
-
-MIT

@@ -1,12 +1,25 @@
 /**
- * HRUFT Pro v4.0.0 (High Reliability UDT File Transfer - Professional)
+ * HRUFT Pro v4.0.0 —— 基于 UDT4 的可靠大文件传输
  *
- * Dependencies:
- *   1. UDT4  (libudt)  - https://github.com/JinBiLianShao/udt4
- *   2. BLAKE3 (libblake3)
+ * 作者：连思鑫
+ *
+ * 依赖：
+ *   1. UDT4        —— https://github.com/JinBiLianShao/udt4
+ *   2. BLAKE3      —— lib/ 下附带四个平台的预编译库
  *   3. nlohmann/json
  *
- * v4.0.0 破坏性变更：控制消息全部改为带长度前缀的定长帧，与 v3.x 不互通。
+ * 写这个程序的起因很简单：普通 TCP 传大文件，跨运营商或者出国链路一丢包
+ * 速度就塌到几百 KB/s，等一个 100GB 的包要一整天。换成基于 UDP 的 UDT 之后
+ * 同样的链路能跑满带宽，所以有了这个东西。
+ *
+ * v4.0.0 是破坏性更新。v3 的控制消息没有长度前缀，靠「一次 recv 恰好读到
+ * 一条消息」来区分，而 UDT 是字节流语义，这个假设根本不成立——ACK 会被
+ * 报告数据污染、文件名会被截断、报告会丢前半截。v4 全部改成带长度前缀的
+ * 定长帧，代价是和 v3 不互通，收发两端必须一起升。
+ *
+ * 性能上走过的弯路记在 tests/README.md 里了，最要紧的一条：MSS 必须两端
+ * 显式给同一个值，别指望 UDT 自己协商——协商取的是双方较小值，一端给
+ * 8900 一端给 1500 的话，FC 会按 8900 算包数却按 1500 发包，实测掉 30 倍。
  */
 
 #include <iostream>
@@ -50,6 +63,9 @@ namespace fs = std::filesystem;
 
 // ============================ 常量 ============================
 
+// 应用层一次读写 4MB。这个值是我试出来的：太小系统调用次数多，
+// 太大缓冲池吃内存且流水线延迟变高。4MB 在 NVMe 和千兆网下都合适。
+
 static const uint32_t MAGIC_ID = 0x48525034;   // "HRP4"
 static const uint16_t PROTO_VERSION = 4;
 
@@ -60,9 +76,13 @@ static const int DEFAULT_WINDOW = 10 * 1024 * 1024;   // 10MB
 static const int MIN_MSS = 536;
 static const int MAX_MSS = 8900;
 static const int MIN_WINDOW = 64 * 1024;
-static const int PIPELINE_DEPTH = 4;                  // 流水线缓冲块数
+#ifndef HRUFT_PIPELINE_DEPTH
+#define HRUFT_PIPELINE_DEPTH 4
+#endif
+static const int PIPELINE_DEPTH = HRUFT_PIPELINE_DEPTH;   // 流水线缓冲块数
 
-// 帧类型
+// 帧类型。只有控制消息走帧，文件数据是裸字节流——
+// 给每 4MB 数据套一层帧头纯属浪费，长度由协议头里的 file_size 精确界定。
 enum FrameType : uint8_t {
     FRAME_HEADER = 1,   // 协议头 + 文件名
     FRAME_HASH   = 2,   // 32 字节 BLAKE3
@@ -74,6 +94,9 @@ enum FrameType : uint8_t {
 enum AckStatus : uint8_t { ACK_OK = 0, ACK_HASH_FAIL = 1, ACK_ABORT = 2 };
 
 // ============================ 协议头 ============================
+
+// 大端、定长 24 字节。文件名紧跟在后面，不带结尾的 NUL。
+// 加了 version 和 flags 是为了以后能协商，不用再改一次协议。
 
 #pragma pack(push, 1)
 struct ProtocolHeader {
@@ -112,7 +135,50 @@ public:
 };
 #endif
 
-// 路径与字符串互转：Windows 下统一走 UTF-8 <-> UTF-16
+// 校验 UTF-8 合法性。
+//
+// 为什么非查不可：文件名是网络对面送来的，我用 std::string 收，转 fs::path
+// 的时候 Windows 会走 MultiByteToWideChar，非法 UTF-8 要么直接失败，要么
+// 被替换成 U+FFFD，用户看到的文件名就变了。所以宁可拒收，也不能落一个
+// 名字对不上的文件。
+//
+// 这里按标准严格查：过长编码、代理区、超 U+10FFFF 全部拒绝。
+static bool isValidUtf8(const std::string &s) {
+    size_t i = 0, n = s.size();
+    while (i < n) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        size_t extra = 0;
+        uint32_t cp = 0;
+
+        if (c < 0x80) { ++i; continue; }
+        else if ((c & 0xE0) == 0xC0) { extra = 1; cp = c & 0x1F; }
+        else if ((c & 0xF0) == 0xE0) { extra = 2; cp = c & 0x0F; }
+        else if ((c & 0xF8) == 0xF0) { extra = 3; cp = c & 0x07; }
+        else return false;   // 0x80-0xBF 作首字节，或 5/6 字节过长编码
+
+        if (i + extra >= n) return false;   // 后续字节不足
+
+        for (size_t k = 1; k <= extra; ++k) {
+            unsigned char cc = static_cast<unsigned char>(s[i + k]);
+            if ((cc & 0xC0) != 0x80) return false;
+            cp = (cp << 6) | (cc & 0x3F);
+        }
+        // 拒绝过长编码与代理区
+        if (extra == 1 && cp < 0x80) return false;
+        if (extra == 2 && cp < 0x800) return false;
+        if (extra == 3 && cp < 0x10000) return false;
+        if (cp >= 0xD800 && cp <= 0xDFFF) return false;
+        if (cp > 0x10FFFF) return false;
+
+        i += extra + 1;
+    }
+    return true;
+}
+
+// 路径与字符串互转。
+// Windows 上全程 UTF-8 <-> UTF-16，因为 fs::path 内部是 wchar_t，
+// 直接用 std::string 构造会在非中文 locale 下乱码。Linux 下本来就是 UTF-8，
+// 直接透传即可。
 static fs::path toPath(const std::string &utf8) {
 #ifdef _WIN32
     return fs::path(Utf8Util::toWide(utf8));
@@ -147,6 +213,15 @@ static std::string pathToUtf8(const fs::path &p) {
 
 // ============================ 拥塞控制 ============================
 
+// 直连场景用的「不控制」拥塞算法。
+//
+// 为什么需要：两台机器网线直连时根本不存在中间链路拥塞，UDT 默认的
+// CUDTCC 还在那儿慢启动、丢一个包就退让，纯属自找麻烦。这个类什么都不做，
+// 发送周期和窗口都定死。
+//
+// 注意单位：m_dPktSndPeriod 是微秒/包，m_dCWndSize 是**包数**不是字节。
+// 我一开始按字节写，结果窗口大了几千倍，一发包就把接收端打爆。
+
 class SimpleCC : public CCC {
 public:
     SimpleCC() {
@@ -170,6 +245,10 @@ public:
 };
 
 // ============================ 网络分析 ============================
+
+// 把 UDT 的 perfmon 数据转成 JSON，再按几条经验规则给点建议。
+// 规则都很朴素，就是拿 BDP 和配置窗口比大小、看重传率。
+// 别指望它能诊断出所有问题，它只能告诉你「窗口配小了」这类明显的。
 
 class NetworkStats {
 public:
@@ -257,7 +336,13 @@ struct Config {
     std::string ip;
     int port = 0;
     std::string path;
+    // MSS 默认 1500，两端一致。
+    // 试过「默认不设、让 UDT 自己协商」，结果更糟：UDT 握手取双方较小值，
+    // 发送端不设就是 1500，而接收端若给了 8900，FC 会按 8900 算包数、
+    // 实际却按 1500 发包，窗口严重失配，实测吞吐从 370 掉到 9 MB/s。
+    // 结论：两端必须显式给同一个值，所以这里保留具体默认值。
     int mss = DEFAULT_MSS;
+    bool mss_explicit = false;
     int window = DEFAULT_WINDOW;
     bool detailed = false;
     bool no_cc = false;
@@ -269,7 +354,7 @@ struct Config {
                   << "  hruft send <ip> <port> <filepath> [options]\n"
                   << "  hruft recv <port> <savepath> [options]\n\n"
                   << "Options:\n"
-                  << "  --mss <value>      Maximum Segment Size, 536-8900 (default: 1500)\n"
+                  << "  --mss <value>      Maximum Segment Size, 536-8900 (default: 1500; give BOTH ends the same value)\n"
                   << "  --window <value>   Window size in bytes (default: 10MB, max: 256MB)\n"
                   << "  --max-size <value> Receiver: reject files larger than this many bytes (default: unlimited)\n"
                   << "  --detailed         Show detailed statistics\n"
@@ -326,6 +411,7 @@ struct Config {
                 if (c.mss < MIN_MSS || c.mss > MAX_MSS)
                     throw std::runtime_error("MSS must be between " + std::to_string(MIN_MSS) +
                                              " and " + std::to_string(MAX_MSS));
+                c.mss_explicit = true;
             } else if (arg == "--window" && idx + 1 < argc) {
                 uint64_t w = parseU64(argv[++idx], "window size");
                 if (w < static_cast<uint64_t>(MIN_WINDOW))
@@ -376,7 +462,12 @@ public:
     }
 };
 
-// ---- 完整读写（UDT 是字节流，绝不假设一次 recv/send 恰好一条消息）----
+// ---- 完整读写 ----
+//
+// UDT 是字节流，recv 返回的是「当前可读多少」，不是「一条消息」。
+// v3 就是栽在这儿：一次 recv 想读整条 ACK，结果把后面的 JSON 报告也吞了，
+// 于是 ACK 比对失败、报告解析失败，两边日志都是错的。
+// 所以现在一律循环读写，读到够数为止。
 
 static void writeFully(UDTSOCKET s, const char *data, size_t len) {
     size_t off = 0;
@@ -389,7 +480,8 @@ static void writeFully(UDTSOCKET s, const char *data, size_t len) {
     }
 }
 
-// 返回 false 表示对端在读取任何字节前干净关闭
+// 返回 false 表示对端在一个字节都没发的情况下干净关闭了。
+// 这种情况是正常的（比如客户端连上就断），不算错误，由调用方决定怎么处理。
 static bool readFully(UDTSOCKET s, char *data, size_t len) {
     size_t off = 0;
     while (off < len) {
@@ -407,7 +499,11 @@ static bool readFully(UDTSOCKET s, char *data, size_t len) {
     return true;
 }
 
-// 帧格式: [u32 长度(含类型字节, 大端)][u8 类型][payload]
+// 帧格式：[u32 长度(大端, 含类型字节)][u8 类型][payload]
+//
+// 长度字段把类型字节也算进去，这样解析时 payload 长度 = 长度 - 1，
+// 少一次加减心算，也不容易搞错。上限 64MB，正常控制消息远达不到，
+// 设这个上限纯粹是为了不让恶意对端用一个巨大的长度值把内存吃光。
 static void sendFrame(UDTSOCKET s, uint8_t type, const std::string &payload) {
     uint32_t total = static_cast<uint32_t>(payload.size() + 1);
     if (total > 64u * 1024u * 1024u) throw std::runtime_error("Frame too large");
@@ -441,7 +537,47 @@ static void setRecvTimeout(UDTSOCKET s, int ms) {
         throw std::runtime_error("Failed to set receive timeout: " + Utils::errText());
 }
 
+// ============================ 临时文件守卫 ============================
+
+// 临时文件守卫。
+//
+// 接收端先写 <目标>.part，哈希对上了才 rename 成正式名字。这样即使传输
+// 中途崩了，用户目录里也不会出现一个「看着像完整文件其实缺一半」的东西。
+//
+// 但光这样还不够——.part 本身也得清掉。我最早是在每个失败分支里手动
+// remove，结果健壮性测试一跑，26 种畸形输入里有 10 种会留下 .part：
+// 对端断开、帧错误、超时、磁盘写满……异常路径太多，漏一个就残留。
+// 改成 RAII 之后，只要离开作用域就自动删，不用再一个个补。
+//
+// 用的时候记住：rename 成功之后一定要调 release()，否则析构时会把
+// 刚落地的正式文件删掉。
+class TempFileGuard {
+public:
+    explicit TempFileGuard(fs::path p) : path_(std::move(p)) {}
+    ~TempFileGuard() {
+        if (!armed_) return;
+        std::error_code ec;
+        fs::remove(path_, ec);   // 已 rename 走或已手动删过时，这里就是 no-op
+    }
+    // 正式落地后调用，撤销自动清理
+    void release() { armed_ = false; }
+    const fs::path &path() const { return path_; }
+
+private:
+    fs::path path_;
+    bool armed_ = true;
+};
+
 // ============================ 流水线缓冲池 ============================
+
+// 收发都用三段流水线：读盘/写盘、BLAKE3 计算、网络收发各占一个线程，
+// 中间靠这个池子传递缓冲块。
+//
+// 设计上刻意不做队列长度限制以外的调度：acquire 拿空块，填好后 pushReady，
+// 消费端 popReady 处理完再 release。池子满了自然就把生产者挡住，等于背压。
+//
+// 深度实测过 4 / 8 / 16 三档，吞吐基本没差别（564 / 569 / 561 MB/s），
+// 所以取 4 就行，再深只是多吃内存。
 
 class BufferPool {
 public:
@@ -508,7 +644,11 @@ private:
     bool closed_ = false;
 };
 
-// 线程内异常收集：任何一线程失败都要让主流程失败，而不是静默继续
+// 线程内异常收集。
+//
+// 流水线里的读写线程不能往外抛异常（抛了没人接，直接 terminate），
+// 所以统一存到这儿，主线程 join 完再检查。关键是「不能静默」——
+// 写盘线程失败了主线程还在傻等，最后报一个莫名其妙的超时，排查起来很痛苦。
 struct ErrorSlot {
     std::mutex m;
     std::string msg;
@@ -526,6 +666,11 @@ class HruftPro {
     UDTSOCKET sock_ = UDT::INVALID_SOCK;
     Config cfg_;
 
+    // Socket 参数调优。所有 setsockopt 都检查返回值——
+    // 这些调用在错误时机（比如 bind 之后）会静默失败，不检查就等着
+    // 参数没生效还以为生效了。接收端原来就是在 accept 之后调这个函数，
+    // UDT 那时已经 m_bOpened，11 个 setsockopt 全部无效，日志却还在打印
+    // 「Remote config - MSS: 8900」，看着像成功了。
     void tuneSocket(UDTSOCKET s, int mss, int winSize) {
         auto setInt = [&](UDT::SOCKOPT opt, int v, const char *name) {
             if (UDT::setsockopt(s, 0, opt, &v, sizeof(int)) == UDT::ERROR)
@@ -545,8 +690,14 @@ class HruftPro {
                 throw std::runtime_error("setsockopt UDT_MAXBW failed: " + Utils::errText());
         }
 
-        // 3. 关键：UDT_FC 单位是「包」。不放开 FC，RCVBUF 会被 25600 包截断，
-        //    MSS 1500 时接收窗口实际上限约 37MB，--window 再大也无效。
+        // 3. UDT_FC 必须一起设，这是最容易漏的一条。
+        //
+        //    UDT 里 FC 是「飞行窗口」，单位是包；RCVBUF 是字节。设 RCVBUF 的
+        //    时候内部会拿它跟 FC 比，超过就截断到 FC。而 FC 默认只有 25600 包，
+        //    MSS 1500 时相当于 37MB —— 用户给 --window 128MB 也白给。
+        //
+        //    实测：只设 RCVBUF 时 window_flow 卡在 25600；两个都设之后
+        //    变成 91180，接收缓冲从 38MB 涨到 136MB。
         int pktPayload = std::max(1, mss - 28);
         int fcPackets = static_cast<int>((static_cast<int64_t>(winSize) + pktPayload - 1) / pktPayload);
         fcPackets = std::max(fcPackets, 32);
@@ -632,6 +783,7 @@ public:
         std::cout << "[INFO] Connecting to " << cfg_.ip << ":" << cfg_.port << "..." << std::endl;
         if (UDT::connect(sock_, reinterpret_cast<sockaddr *>(&serv_addr), sizeof(serv_addr)) == UDT::ERROR)
             throw std::runtime_error("Connect failed: " + Utils::errText());
+
         std::cout << "[INFO] Connected successfully" << std::endl;
 
         // --- 协议头帧 ---
@@ -728,7 +880,9 @@ public:
                   << dur << " seconds" << std::endl;
         std::cout << "[INFO] Waiting for receiver confirmation..." << std::endl;
 
-        // --- 等 ACK（带超时，绝不无限阻塞）---
+        // --- 等 ACK ---
+        // 这里必须带超时。原来是不带超时的阻塞 recv，对端一崩发送端就
+        // 永远挂在那儿，Ctrl-C 才能退。
         setRecvTimeout(sock_, 30000);
 
         uint8_t type = 0;
@@ -766,8 +920,14 @@ public:
         if (serv == UDT::INVALID_SOCK)
             throw std::runtime_error("Failed to create server socket: " + Utils::errText());
 
-        // 窗口/MSS 必须在 bind 之前设置：bind 之后 UDT 会置 m_bOpened，
-        // 此后 UDT_MSS/UDT_SNDBUF/UDT_RCVBUF/UDP_* 一律被拒。
+        // 注意顺序：MSS 和窗口必须在 bind 之前设好。
+        //
+        // UDT 的 bind 会调 open()，之后 m_bOpened 就是 true，再调
+        // UDT_MSS / UDT_SNDBUF / UDT_RCVBUF / UDP_SNDBUF / UDP_RCVBUF
+        // 全部抛异常。我原来的写法是 accept 之后才 tuneSocket，
+        // 那时早就 open 过了，参数一个都没生效，还照样打印成功日志。
+        // 发送端参数靠 UDT 握手协商过去，接收端窗口只能靠本地设，
+        // 所以这里必须在 bind 前把本地配置设对。
         tuneSocket(serv, cfg_.mss, cfg_.window);
 
         sockaddr_in my_addr;
@@ -823,11 +983,30 @@ public:
             throw std::runtime_error("Protocol header size mismatch");
 
         std::string rawName = payload.substr(sizeof(ProtocolHeader));
+
+        // 文件名是网络对面给的，必须当成不可信数据处理。
+        //
+        // 先查 NUL：std::string 能存 NUL，但转 fs::path 时会被当成结尾，
+        // 对端发 "a\0b.bin"，本地落成 "a"。不报错、不告警，就是名字变了。
+        // 再查 UTF-8：非法编码在 Windows 上会变成替换字符，用户看到的
+        // 文件名和实际对不上。
+        // 这两条都是健壮性测试抓出来的，以前完全没意识到。
+        if (rawName.find('\0') != std::string::npos)
+            throw std::runtime_error("Filename contains NUL byte");
+        if (!isValidUtf8(rawName))
+            throw std::runtime_error("Filename is not valid UTF-8");
+
         if (cfg_.max_size > 0 && rSize > cfg_.max_size)
             throw std::runtime_error("Incoming file (" + Utils::formatSize(rSize) +
                                      ") exceeds --max-size limit (" + Utils::formatSize(cfg_.max_size) + ")");
 
-        // 路径穿越防护：只保留纯文件名
+        // 路径穿越防护：只留纯文件名，路径部分一律丢掉。
+        //
+        // 不做这一步的话，对端发一个 "../../.bashrc" 或者 "/etc/passwd"
+        // 就能写到任意位置去 —— fs::path 的 operator/= 遇到绝对路径会
+        // 直接替换掉整个前缀，实测确实是这样。
+        // 现在 "../../evil.sh" 会降级成 "evil.sh"，落在预期目录里；
+        // ".." 和 "." 这种没法降级的直接拒收。
         fs::path namePath = toPath(rawName);
         std::string safeName = pathToUtf8(namePath.filename());
         if (safeName.empty() || safeName == "." || safeName == ".." ||
@@ -851,14 +1030,19 @@ public:
                 outPath = baseDir / toPath(safeName);
         }
 
-        // 创建父目录（空 parent 必须跳过，否则抛 filesystem error）
+        // 创建父目录。空 parent 一定要跳过 ——
+        // 用户写 "hruft recv 9000 out.bin" 时 parent_path() 是空串，
+        // create_directories("") 在 libstdc++ 下直接抛
+        // "filesystem error: cannot create directories: Invalid argument"。
+        // 这个 bug 从 v3 一直带到现在，README 里还教人这么用。
         fs::path parent = outPath.parent_path();
         if (!parent.empty()) {
             fs::create_directories(parent, ec);
             if (ec) throw std::runtime_error("Cannot create directory " + pathToUtf8(parent) + ": " + ec.message());
         }
 
-        // 同名冲突：循环加序号，绝不复用可能被覆盖的名字
+        // 同名冲突加序号。
+        // 原来用的是秒级时间戳后缀，同秒传两次就重名，第二次直接把第一次覆盖掉。
         if (fs::exists(outPath, ec)) {
             fs::path dir = outPath.parent_path();
             std::string stem = pathToUtf8(outPath.stem());
@@ -869,9 +1053,11 @@ public:
             }
         }
 
-        // 先写 .part，校验通过后再改名，避免留下损坏文件
+        // 先写 .part，校验通过再改名。
+        // guard 的作用域要覆盖到整个接收流程结束，中途任何异常退出都会清掉。
         fs::path partPath = outPath;
         partPath += ".part";
+        TempFileGuard partGuard(partPath);
 
         std::ofstream ofs(partPath, std::ios::binary | std::ios::trunc);
         if (!ofs) throw std::runtime_error("Cannot open file for writing: " + pathToUtf8(partPath));
@@ -972,14 +1158,14 @@ public:
         std::cout << "[INFO] Hash verification: " << (match ? "PASS" : "FAIL") << std::endl;
 
         if (match) {
-            // 校验通过才落地
+            // rename 成功后必须 release，不然 guard 析构时会把刚写好的正式文件删了
             fs::rename(partPath, outPath, ec);
-            if (ec) {
-                fs::remove(partPath, ec);
-                throw std::runtime_error("Cannot finalize output file: " + pathToUtf8(outPath));
-            }
+            if (ec)
+                throw std::runtime_error("Cannot finalize output file: " + pathToUtf8(outPath) +
+                                         ": " + ec.message());
+            partGuard.release();
         } else {
-            fs::remove(partPath, ec);
+            // 这里不用手动删，guard 析构时会清掉 .part
             std::cout << "[ERROR] Local hash:  " << localHash << std::endl;
             std::cout << "[ERROR] Remote hash: " << remoteHash << std::endl;
             std::cout << "[ERROR] Corrupted file removed" << std::endl;
