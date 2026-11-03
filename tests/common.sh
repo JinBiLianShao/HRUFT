@@ -9,35 +9,67 @@
 
 set +e
 
+# 仓库根目录。注意 common.sh 在 tests/ 下，所以往上只跳一层。
+# （最早写成 ../../，结果指向了仓库的父目录，导致构建好了也找不到二进制。）
+_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
 HRUFT_BIN="${HRUFT_BIN:-}"
 if [ -z "$HRUFT_BIN" ]; then
-    for c in "$(dirname "${BASH_SOURCE[0]}")/../../build/hruft" \
-             "$(dirname "${BASH_SOURCE[0]}")/../../cmake-build-debug/hruft" \
-             "$(command -v hruft)"; do
-        [ -x "$c" ] && HRUFT_BIN="$c" && break
+    for c in "$_REPO_ROOT/build/hruft" \
+             "$_REPO_ROOT/cmake-build-debug/hruft" \
+             "$_REPO_ROOT/cmake-build-release/hruft" \
+             "$(command -v hruft 2>/dev/null)"; do
+        [ -n "$c" ] && [ -x "$c" ] && HRUFT_BIN="$c" && break
     done
 fi
 if [ -z "$HRUFT_BIN" ] || [ ! -x "$HRUFT_BIN" ]; then
-    echo "找不到 hruft 可执行文件。请先构建，或设置 HRUFT_BIN=/path/to/hruft" >&2
+    cat >&2 <<'ERR'
+找不到 hruft 可执行文件。
+请先在仓库根目录构建：
+    cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+    cmake --build build -j
+或显式指定：
+    HRUFT_BIN=/path/to/hruft ./tests/run_all.sh
+ERR
     exit 2
 fi
 
-# UDT 路径探测：安全测试需要自己编译一个伪造对端，得知道头文件和库在哪
+# UDT 路径探测：安全测试和健壮性测试要自己编译「伪造对端」，
+# 得知道 UDT 的头文件和静态库在哪。
+#
+# 探测顺序：
+#   1. 构建目录里 CMake 作为子项目编出来的 libudt.a（最可靠，版本一定对）
+#   2. 仓库同级的 udt4 源码树（自己编一份）
 HRUFT_UDT_INCLUDE="${HRUFT_UDT_INCLUDE:-}"
 HRUFT_UDT_LIB="${HRUFT_UDT_LIB:-}"
-_TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 if [ -z "$HRUFT_UDT_INCLUDE" ]; then
-    for c in "$_TESTS_DIR/../../udt4/src" "$_TESTS_DIR/../../../udt4/src" /usr/include/udt; do
+    for c in "$_REPO_ROOT/../udt4/src" "$_REPO_ROOT/udt4/src" /usr/include/udt; do
         [ -f "$c/udt.h" ] && HRUFT_UDT_INCLUDE="$c" && break
     done
 fi
+
 if [ -z "$HRUFT_UDT_LIB" ]; then
-    for c in "$_TESTS_DIR/../../build/udt4/libudt.a" \
-             "$_TESTS_DIR/../../cmake-build-debug/udt4/libudt.a" \
-             "$_TESTS_DIR/../../../udt4/cmake-build-debug/libudt.a" \
-             "$_TESTS_DIR/../../../udt4/build/libudt.a"; do
+    for c in "$_REPO_ROOT/build/udt4/libudt.a" \
+             "$_REPO_ROOT/cmake-build-debug/udt4/libudt.a" \
+             "$_REPO_ROOT/cmake-build-release/udt4/libudt.a"; do
         [ -f "$c" ] && HRUFT_UDT_LIB="$c" && break
     done
+fi
+
+# 构建目录里没有，就现编一份 UDT（只在需要伪造对端的套件里用到）
+if [ -z "$HRUFT_UDT_LIB" ] && [ -n "$HRUFT_UDT_INCLUDE" ]; then
+    _udt_src="$(cd "$HRUFT_UDT_INCLUDE/.." 2>/dev/null && pwd)"
+    if [ -n "$_udt_src" ] && [ -d "$_udt_src/src" ]; then
+        _udt_build="$WORK/udt4-build"
+        mkdir -p "$_udt_build"
+        if cmake -S "$_udt_src" -B "$_udt_build" \
+                 -DUDT_BUILD_SHARED=OFF -DUDT_BUILD_STATIC=ON \
+                 -DCMAKE_BUILD_TYPE=Release > /dev/null 2>&1 && \
+           cmake --build "$_udt_build" -j"$(nproc)" > /dev/null 2>&1; then
+            [ -f "$_udt_build/libudt.a" ] && HRUFT_UDT_LIB="$_udt_build/libudt.a"
+        fi
+    fi
 fi
 
 # 端口从环境变量取，多个测试并行跑时不会撞车
