@@ -1,5 +1,5 @@
 /**
- * HRUFT Pro v4.0.0 —— 基于 UDT4 的可靠大文件传输
+ * HRUFT Pro v4.1.0 —— 基于 UDT4 的可靠大文件传输
  *
  * 作者：连思鑫
  *
@@ -56,6 +56,12 @@
 #include <udt.h>
 #include <ccc.h>
 #include "blake3.h"
+
+// 版本号由 CMake 通过 target_compile_definitions 注入，
+// 避免出现「CMakeLists 写 4.1.0、Usage 里还印着 4.0.0」这种不一致。
+#ifndef HRUFT_VERSION
+#define HRUFT_VERSION "unknown"
+#endif
 #include "json.hpp"
 
 using json = nlohmann::json;
@@ -67,9 +73,15 @@ namespace fs = std::filesystem;
 // 太大缓冲池吃内存且流水线延迟变高。4MB 在 NVMe 和千兆网下都合适。
 
 static const uint32_t MAGIC_ID = 0x48525034;   // "HRP4"
-static const uint16_t PROTO_VERSION = 4;
+static const uint16_t PROTO_VERSION = 4;   // 协议本身没变，只是软件版本号升
 
-static const int APP_BLOCK_SIZE = 4 * 1024 * 1024;    // 4MB 应用层分块
+#ifndef HRUFT_BLOCK_KB
+#define HRUFT_BLOCK_KB 4096
+#endif
+// 应用层一次读写的大小。默认 4MB。
+// 太小则系统调用和 UDT send 次数变多，太大则缓冲池吃内存、流水线延迟变高。
+// 实测 1/2/4/8/16MB 在 loopback 上吞吐差别在噪声内，所以取 4MB 折中。
+static const int APP_BLOCK_SIZE = HRUFT_BLOCK_KB * 1024;
 static const int UDT_MAX_BUF   = 256 * 1024 * 1024;   // 256MB 上限
 static const int DEFAULT_MSS   = 1500;
 static const int DEFAULT_WINDOW = 10 * 1024 * 1024;   // 10MB
@@ -238,10 +250,49 @@ public:
     void close() override {}
 };
 
+// 跳过慢启动的拥塞控制。
+//
+// 为什么需要：UDT 默认 CUDTCC 的 init() 里 m_dCWndSize = 16，也就是从
+// 16 个包开始翻倍爬升，而每次翻倍要等一个 10ms 的 RC 周期。传大文件时
+// 这点爬坡时间可以忽略，但传几十 MB 的文件就很明显了 —— 实测 16MB 要
+// 0.42s，其中绝大部分花在从 16 包爬到窗口上限。
+//
+// 这里直接把初始窗口给到最大，让发送端一开始就满速。代价是不做拥塞退让，
+// 所以只在 --fast-start 且链路可控时启用。
+class FastStartCC : public CCC {
+public:
+    void init() override {
+        // 直接给到大窗口，跳过爬坡；m_dMaxCWndSize 由 UDT 按接收端通告的
+        // 飞行窗口设置，这里给一个足够大的值，实际会被它夹住。
+        m_dCWndSize = m_dMaxCWndSize > 0 ? m_dMaxCWndSize : 25600.0;
+        m_dPktSndPeriod = 1.0;
+        // ACK 间隔调小，让窗口更新更及时
+        setACKInterval(2);
+    }
+    void onACK(int32_t) override {
+        // 维持大窗口，不因 ACK 变化而收缩
+        if (m_dCWndSize < m_dMaxCWndSize) m_dCWndSize = m_dMaxCWndSize;
+    }
+    void onLoss(const int32_t *, int) override {
+        // 不因丢包退让（直连场景）
+    }
+    void onTimeout() override {}
+    void onPktSent(const CPacket *) override {}
+    void onPktReceived(const CPacket *) override {}
+    void processCustomMsg(const CPacket *) override {}
+    void close() override {}
+};
+
 class SimpleCCFactory : public CCCVirtualFactory {
 public:
     CCC *create() override { return new SimpleCC; }
     CCCVirtualFactory *clone() override { return new SimpleCCFactory; }
+};
+
+class FastStartCCFactory : public CCCVirtualFactory {
+public:
+    CCC *create() override { return new FastStartCC; }
+    CCCVirtualFactory *clone() override { return new FastStartCCFactory; }
 };
 
 // ============================ 网络分析 ============================
@@ -261,6 +312,11 @@ public:
             {"est_bandwidth_mbps", perf.mbpsBandwidth}
         });
         j["latency"] = json::object({{"rtt_ms", perf.msRTT}});
+        // 注意统计口径：pktRetransTotal 只统计「本端重传了多少包」。
+        // 接收端不发送数据，所以这个值恒为 0 —— 拿它算重传率会得出
+        // 「网络零丢包」的错误结论。真正反映链路质量的是 pkt_loss_recv
+        // （本端检测到丢了多少包），重传率应该在**发送端**看。
+        // 这里两个都给，并在字段名上标清楚，避免看报告的人误读。
         j["reliability"] = json::object({
             {"pkt_sent", perf.pktSentTotal},
             {"pkt_recv", perf.pktRecvTotal},
@@ -269,7 +325,12 @@ public:
             {"retrans_total", perf.pktRetransTotal},
             {"retrans_ratio", perf.pktSentTotal > 0
                  ? static_cast<double>(perf.pktRetransTotal) / static_cast<double>(perf.pktSentTotal)
-                 : 0.0}
+                 : 0.0},
+            // 收包丢包率：接收端唯一有意义的链路质量指标
+            {"recv_loss_ratio", perf.pktRecvTotal > 0
+                 ? static_cast<double>(perf.pktRcvLossTotal) / static_cast<double>(perf.pktRecvTotal)
+                 : 0.0},
+            {"retrans_note", "retrans_* 仅统计本端重传；接收端恒为 0，请看 recv_loss_ratio"}
         });
         j["congestion"] = json::object({
             {"window_flow", perf.pktFlowWindow},
@@ -291,7 +352,9 @@ public:
         double lossRate = 0.0, bandwidth = 0.0, rtt = 0.0;
         int64_t availRcvBuf = 0;
         try {
-            lossRate  = stats.at("reliability").at("retrans_ratio").get<double>();
+            // 用 recv_loss_ratio 而不是 retrans_ratio：接收端不发送数据，
+            // retrans 恒为 0，用它判断链路质量会永远是「优秀」。
+            lossRate  = stats.at("reliability").at("recv_loss_ratio").get<double>();
             bandwidth = stats.at("throughput").at("est_bandwidth_mbps").get<double>();
             rtt       = stats.at("latency").at("rtt_ms").get<double>();
             availRcvBuf = stats.at("buffer_health").at("rcv_buf_avail_bytes").get<int64_t>();
@@ -311,7 +374,7 @@ public:
             advice.push_back("可能瓶颈: 接收缓冲区快满了。考虑增大窗口大小或检查磁盘IO。");
         }
         if (lossRate > 0.01) {
-            advice.push_back("网络质量: 高重传率 (" + std::to_string(lossRate * 100) + "%)。检查网络稳定性。");
+            advice.push_back("网络质量: 高丢包率 (" + std::to_string(lossRate * 100) + "%)。检查网络稳定性。");
             health = "network_lossy";
             if (configMss > 1400) advice.push_back("优化建议: 尝试减少MSS到1400以避免IP分片。");
         } else if (lossRate > 0.001) {
@@ -346,10 +409,11 @@ struct Config {
     int window = DEFAULT_WINDOW;
     bool detailed = false;
     bool no_cc = false;
-    uint64_t max_size = 0;   // 0 = 不限
+    bool fast_start = false;   // 跳过慢启动爬坡
+    uint64_t max_size = 0;     // 0 = 不限
 
     static void printUsage() {
-        std::cerr << "HRUFT Pro " << "4.0.0" << "\n"
+        std::cerr << "HRUFT Pro " << HRUFT_VERSION << "\n"
                   << "Usage:\n"
                   << "  hruft send <ip> <port> <filepath> [options]\n"
                   << "  hruft recv <port> <savepath> [options]\n\n"
@@ -358,7 +422,9 @@ struct Config {
                   << "  --window <value>   Window size in bytes (default: 10MB, max: 256MB)\n"
                   << "  --max-size <value> Receiver: reject files larger than this many bytes (default: unlimited)\n"
                   << "  --detailed         Show detailed statistics\n"
-                  << "  --no-cc            Disable congestion control (direct links only)\n";
+                  << "  --no-cc            Disable congestion control (direct links only)\n"
+                  << "  --fast-start       Skip slow-start ramp-up (much faster on small files,\n"
+                  << "                     but no congestion back-off: direct links only)\n";
     }
 
     static int parsePort(const std::string &s) {
@@ -424,6 +490,8 @@ struct Config {
                 c.detailed = true;
             } else if (arg == "--no-cc") {
                 c.no_cc = true;
+            } else if (arg == "--fast-start") {
+                c.fast_start = true;
             } else {
                 throw std::runtime_error("Unknown option: " + arg);
             }
@@ -680,7 +748,10 @@ class HruftPro {
         // 1. MSS 必须在 bind/connect 之前
         setInt(UDT_MSS, mss, "UDT_MSS");
 
-        // 2. 关闭拥塞控制（可选）
+        // 2. 拥塞控制（可选）
+        //
+        // --no-cc 和 --fast-start 二选一，前者完全不控制，后者只跳过爬坡。
+        // 两者都必须在 connect/bind 之前设，UDT 会 clone 这个工厂。
         if (cfg_.no_cc) {
             SimpleCCFactory factory;
             if (UDT::setsockopt(s, 0, UDT_CC, &factory, sizeof(SimpleCCFactory)) == UDT::ERROR)
@@ -688,6 +759,10 @@ class HruftPro {
             int64_t max_bw = 1000000000;   // 单位：字节/秒 = 8 Gbps
             if (UDT::setsockopt(s, 0, UDT_MAXBW, &max_bw, sizeof(int64_t)) == UDT::ERROR)
                 throw std::runtime_error("setsockopt UDT_MAXBW failed: " + Utils::errText());
+        } else if (cfg_.fast_start) {
+            FastStartCCFactory factory;
+            if (UDT::setsockopt(s, 0, UDT_CC, &factory, sizeof(FastStartCCFactory)) == UDT::ERROR)
+                throw std::runtime_error("setsockopt UDT_CC failed: " + Utils::errText());
         }
 
         // 3. UDT_FC 必须一起设，这是最容易漏的一条。
@@ -790,7 +865,7 @@ public:
         ProtocolHeader hdr;
         hdr.magic = htonl(MAGIC_ID);
         hdr.version = htons(PROTO_VERSION);
-        hdr.flags = htons(cfg_.no_cc ? 1 : 0);
+        hdr.flags = htons(static_cast<uint16_t>((cfg_.no_cc ? 1 : 0) | (cfg_.fast_start ? 2 : 0)));
         hdr.file_size = htonll(fsize);
         hdr.filename_len = htonl(static_cast<uint32_t>(fname.size()));
         hdr.reserved = 0;
@@ -1195,6 +1270,7 @@ public:
             {"avg_speed_mbps", duration > 0 ? (rSize * 8.0 / 1000000.0) / duration : 0.0},
             {"avg_speed_mbs", duration > 0 ? (rSize / (1024.0 * 1024.0)) / duration : 0.0},
             {"congestion_control_disabled", cfg_.no_cc},
+            {"fast_start", cfg_.fast_start},
             {"protocol_version", PROTO_VERSION}
         });
 

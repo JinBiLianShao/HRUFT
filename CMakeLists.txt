@@ -13,7 +13,7 @@
 
 cmake_minimum_required(VERSION 3.16)
 
-project(hruft VERSION 4.0.0 LANGUAGES C CXX)
+project(hruft VERSION 4.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -140,6 +140,11 @@ add_executable(${PROJECT_NAME} ${SRC_FILES})
 target_include_directories(${PROJECT_NAME} PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/lib"
         "${UDT_INCLUDE_DIR}")
+
+# 版本号只在这里定义一次，源码里用 HRUFT_VERSION 宏取，
+# 避免 CMakeLists 和 Usage 输出各写一个版本号然后对不上。
+target_compile_definitions(${PROJECT_NAME} PRIVATE
+        HRUFT_VERSION="${PROJECT_VERSION}")
 
 if (TARGET_OS STREQUAL "windows")
     target_compile_definitions(${PROJECT_NAME} PRIVATE WIN32 _WIN32 _WIN32_WINNT=0x0600 _CRT_SECURE_NO_WARNINGS)

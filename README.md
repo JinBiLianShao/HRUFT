@@ -7,7 +7,7 @@
 ![C++](https://img.shields.io/badge/C%2B%2B-17-blue)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey)
 ![License](https://img.shields.io/badge/license-MIT-blue)
-![Version](https://img.shields.io/badge/version-4.0.0-green)
+![Version](https://img.shields.io/badge/version-4.1.0-green)
 
 ---
 
@@ -90,6 +90,7 @@ hruft send <ip> <port> <filepath> [options]
 | `--window` | 窗口大小（字节），最小 64KB，上限 256MB | 10MB |
 | `--detailed` | 每秒输出瞬时速率 | 关 |
 | `--no-cc` | 关闭拥塞控制（仅直连链路） | 关 |
+| `--fast-start` | 跳过慢启动爬坡（小文件快 4 倍，弱网快 10~25 倍） | 关 |
 
 ### 接收端
 
@@ -106,6 +107,7 @@ hruft recv <port> <savepath> [options]
 | `--max-size` | 拒绝大于该字节数的文件 | 不限 |
 | `--detailed` | 每秒输出瞬时速率 | 关 |
 | `--no-cc` | 关闭拥塞控制 | 关 |
+| `--fast-start` | 跳过慢启动爬坡 | 关 |
 
 ---
 
@@ -149,6 +151,25 @@ UDT 默认的慢启动和丢包退让纯属拖后腿。
 
 > 但共享链路上不要用。关掉拥塞控制意味着丢包时不会退让，
 > 会挤占别人的带宽，也可能让整条链路更堵。
+
+### `--fast-start`：弱网和小文件的救命选项
+
+UDT 默认拥塞控制从 16 个包的窗口开始爬坡，每次翻倍要等 10ms。传大文件无所谓，
+但小文件几乎全耗在爬坡上。实测：
+
+| 场景 | 默认 | `--fast-start` |
+|------|------|-----------------|
+| 16MB，无丢包 | 25 MB/s | **116 MB/s** |
+| 64MB，无丢包 | 97 MB/s | **411 MB/s** |
+| 64MB，丢包 1% | 11 MB/s | **130 MB/s** |
+| 64MB，丢包 2% | 6.8 MB/s | **128 MB/s** |
+| 64MB，丢包 5% | 2.4 MB/s | **60 MB/s** |
+
+**丢包越严重，差距越大**。因为丢包让 ACK 变稀疏，默认模式的拥塞窗口
+会卡在 16 个包上不去（报告里 `window_cong: 16` 而 `window_flow: 15128`）。
+
+> 同样不适合公网共享链路——它不做拥塞退让。适合的是**链路差但可控**的场景，
+> 比如自家专线、卫星链路，默认模式在那里会退化到几 MB/s 完全没法用。
 
 ---
 
@@ -283,7 +304,7 @@ cmake --build build-arm64 -j
 HRUFT_BIN=./build/hruft ./tests/performance/bench.sh
 ```
 
-目前 73 个用例：功能 23、安全 23、健壮性 27。
+目前 80 个用例：功能 23、安全 23、健壮性 27、丢包环境 7。
 测试说明和实测数据在 [`tests/README.md`](tests/README.md)。
 
 ---
@@ -329,6 +350,26 @@ UDT4 的 `CMakeLists.txt` 漏了 `src/ccc.cpp` 和 `src/cache.cpp`。补进 `UDT
 ---
 
 ## 更新日志
+
+### v4.1.0
+
+**性能**
+- 新增 `--fast-start`：跳过 UDT 慢启动爬坡。16MB 文件快 4.6 倍，
+  2% 丢包环境下快 18.8 倍（实测数据见 `tests/README.md`）
+- 定位到默认模式在丢包环境下的真实瓶颈：`CUDTCC` 的拥塞窗口
+  卡在 16 个包不增长（`window_cong: 16` vs `window_flow: 15128`）
+
+**报告修正**
+- 修复可靠性统计口径错误：`retrans_ratio` 在接收端恒为 0，
+  导致「网络优秀」的错误结论。新增 `recv_loss_ratio`，
+  实测 5% 丢包下能正确报出 4.32%
+- 网络诊断改用真实丢包率，不再被恒零字段误导
+
+**测试**
+- 新增丢包环境测试套件（unshare + tc netem），7 个用例
+- 用 netem 验证了 `--fast-start` / `--no-cc` 在 1%/2%/5% 丢包下的
+  正确性与稳定性
+- 量化了 loopback 噪声水平（±13%），此后的性能结论都以此为门槛
 
 ### v4.0.0
 

@@ -39,6 +39,7 @@ fi
 run_suite "功能测试" functional/test_transfer.sh
 run_suite "安全测试" security/test_malicious.sh
 run_suite "健壮性测试" robustness/test_protocol.sh
+run_suite "丢包环境测试" robustness/test_packet_loss.sh
 run_suite "性能基准" performance/bench.sh
 
 echo
