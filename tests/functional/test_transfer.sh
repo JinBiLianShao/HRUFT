@@ -60,14 +60,20 @@ transfer "$WORK/src/32m.bin" $((P+5))
 same_content "$WORK/src/32m.bin" "$WORK/dst/32m.bin" && ok "32MB" || bad "32MB"
 
 # ---- 大文件 ----
-# 512MB 用来覆盖「多秒传输 + 进度刷新 + 计数溢出」的组合
-echo "[5] 大文件（512MB）"
-make_file $((512*1024*1024)) "$WORK/src/512m.bin"
-transfer "$WORK/src/512m.bin" $((P+6))
-if same_content "$WORK/src/512m.bin" "$WORK/dst/512m.bin"; then
-    ok "512MB"
+# 512MB 用来覆盖「多秒传输 + 进度刷新 + 计数溢出」的组合。
+# 默认跳过（run_all.sh 不带 --full 时），避免常规回归一跑好几分钟；
+# 设了 HRUFT_TEST_BIG=1 才跑。这样和 run_all.sh 的 --full 说明保持一致。
+if [ "${HRUFT_TEST_BIG:-0}" = "1" ]; then
+    echo "[5] 大文件（512MB）"
+    make_file $((512*1024*1024)) "$WORK/src/512m.bin"
+    transfer "$WORK/src/512m.bin" $((P+6))
+    if same_content "$WORK/src/512m.bin" "$WORK/dst/512m.bin"; then
+        ok "512MB"
+    else
+        bad "512MB" "send=$TRANSFER_SEND_EXIT recv=$TRANSFER_RECV_EXIT"
+    fi
 else
-    bad "512MB" "send=$TRANSFER_SEND_EXIT recv=$TRANSFER_RECV_EXIT"
+    skip "大文件 512MB（需要 tests/run_all.sh --full 或 HRUFT_TEST_BIG=1）"
 fi
 
 # ---- 中文文件名 ----

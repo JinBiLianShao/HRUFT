@@ -496,6 +496,12 @@ struct Config {
                 throw std::runtime_error("Unknown option: " + arg);
             }
         }
+
+        // --no-cc 与 --fast-start 同时给时，tuneSocket 里 no_cc 分支会先命中，
+        // fast_start 会被静默吞掉——宁可在这里直接报错。
+        if (c.no_cc && c.fast_start)
+            throw std::runtime_error("--no-cc and --fast-start are mutually exclusive");
+
         return c;
     }
 };

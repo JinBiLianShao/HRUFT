@@ -367,6 +367,11 @@ UDT4 的 `CMakeLists.txt` 漏了 `src/ccc.cpp` 和 `src/cache.cpp`。补进 `UDT
 
 **测试**
 - 新增丢包环境测试套件（unshare + tc netem），7 个用例
+- 修复 ARM 交叉编译：编译器改在 project() 之前设定（CMake 官方要求），
+  一次配置即可用，不再需要两段式重跑；实测 aarch64 产物构建成功
+- 修复 --no-cc 与 --fast-start 同时指定时被静默忽略的问题，现在直接报错
+- 修复 tests/run_all.sh 的 --full 说明与实际行为不一致：
+  512MB 大文件用例改为仅在 --full（或 HRUFT_TEST_BIG=1）时运行
 - 用 netem 验证了 `--fast-start` / `--no-cc` 在 1%/2%/5% 丢包下的
   正确性与稳定性
 - 量化了 loopback 噪声水平（±13%），此后的性能结论都以此为门槛

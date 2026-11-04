@@ -13,6 +13,30 @@
 
 cmake_minimum_required(VERSION 3.16)
 
+# ---------------------------------------------------------------------------------------
+# 0. 交叉编译器（必须在 project() 之前确定）
+#
+# CMake 跑完 project() 就锁定编译器，之后再改 CMAKE_<LANG>_COMPILER 会被静默忽略——
+# 这是旧版 CMakeLists 的坑：-DCOMPILER_TARGET=arm64 实际仍用本机 gcc。这里在
+# project() 之前解析 COMPILER_TARGET 并直接设定编译器，首次配置即可用，
+# 不再需要「改完编译器请你重跑 cmake」的两段式流程。
+# ---------------------------------------------------------------------------------------
+if (COMPILER_TARGET STREQUAL "arm64")
+    find_program(HRUFT_CROSS_C   aarch64-linux-gnu-gcc   REQUIRED)
+    find_program(HRUFT_CROSS_CXX aarch64-linux-gnu-g++   REQUIRED)
+    set(CMAKE_C_COMPILER   ${HRUFT_CROSS_C}   CACHE FILEPATH "" FORCE)
+    set(CMAKE_CXX_COMPILER ${HRUFT_CROSS_CXX} CACHE FILEPATH "" FORCE)
+    set(CMAKE_SYSTEM_NAME Linux)
+    set(CMAKE_SYSTEM_PROCESSOR aarch64)
+elseif (COMPILER_TARGET STREQUAL "arm32")
+    find_program(HRUFT_CROSS_C   arm-linux-gnueabihf-gcc  REQUIRED)
+    find_program(HRUFT_CROSS_CXX arm-linux-gnueabihf-g++  REQUIRED)
+    set(CMAKE_C_COMPILER   ${HRUFT_CROSS_C}   CACHE FILEPATH "" FORCE)
+    set(CMAKE_CXX_COMPILER ${HRUFT_CROSS_CXX} CACHE FILEPATH "" FORCE)
+    set(CMAKE_SYSTEM_NAME Linux)
+    set(CMAKE_SYSTEM_PROCESSOR arm)
+endif ()
+
 project(hruft VERSION 4.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -36,42 +60,6 @@ if (NOT TARGET_OS STREQUAL "linux" AND NOT TARGET_OS STREQUAL "windows")
 endif ()
 if (NOT COMPILER_TARGET STREQUAL "x86" AND NOT COMPILER_TARGET STREQUAL "arm32" AND NOT COMPILER_TARGET STREQUAL "arm64")
     message(FATAL_ERROR "COMPILER_TARGET must be x86, arm32 or arm64, got '${COMPILER_TARGET}'")
-endif ()
-
-# ---------------------------------------------------------------------------------------
-# 2. 交叉编译
-#
-# CMAKE_<LANG>_COMPILER 必须在 project() 之前确定。原配置把它写在 project() 之后，
-# 会被 CMake 静默忽略，导致 -DCOMPILER_TARGET=arm64 实际仍用本机 gcc 编译。
-# 这里在 project() 之后强制改 cache 并重新检查，配合工具链探测给出明确报错。
-# ---------------------------------------------------------------------------------------
-if (COMPILER_TARGET STREQUAL "arm64")
-    set(_hruft_cc "aarch64-linux-gnu-gcc")
-    set(_hruft_cxx "aarch64-linux-gnu-g++")
-    set(_hruft_cross ON)
-elseif (COMPILER_TARGET STREQUAL "arm32")
-    set(_hruft_cc "arm-linux-gnueabihf-gcc")
-    set(_hruft_cxx "arm-linux-gnueabihf-g++")
-    set(_hruft_cross ON)
-else ()
-    set(_hruft_cross OFF)
-endif ()
-
-if (_hruft_cross)
-    find_program(_hruft_cc_path NAMES ${_hruft_cc})
-    find_program(_hruft_cxx_path NAMES ${_hruft_cxx})
-    if (NOT _hruft_cc_path OR NOT _hruft_cxx_path)
-        message(FATAL_ERROR
-                "Cross compiler for ${COMPILER_TARGET} not found (looked for ${_hruft_cc} / ${_hruft_cxx}).\n"
-                "Install it, or build with -DCOMPILER_TARGET=x86.")
-    endif ()
-    if (NOT CMAKE_C_COMPILER MATCHES "${_hruft_cc}")
-        set(CMAKE_C_COMPILER "${_hruft_cc_path}" CACHE FILEPATH "" FORCE)
-        set(CMAKE_CXX_COMPILER "${_hruft_cxx_path}" CACHE FILEPATH "" FORCE)
-        message(FATAL_ERROR
-                "Compiler switched to ${COMPILER_TARGET}. Please re-run cmake in a fresh build directory.")
-    endif ()
-    message(STATUS "Cross-compiling for ${COMPILER_TARGET}")
 endif ()
 
 # ---------------------------------------------------------------------------------------
