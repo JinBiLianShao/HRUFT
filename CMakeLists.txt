@@ -138,7 +138,13 @@ if (TARGET_OS STREQUAL "windows")
     target_compile_definitions(${PROJECT_NAME} PRIVATE WIN32 _WIN32 _WIN32_WINNT=0x0600 _CRT_SECURE_NO_WARNINGS)
     target_link_libraries(${PROJECT_NAME} PRIVATE ws2_32 wsock32 iphlpapi shlwapi)
 else ()
-    find_package(Threads REQUIRED)
+    # GCC 7（老 arm32 交叉工具链）的 std::filesystem 是实验性实现，
+# 需要额外链接 libstdc++fs.a；GCC 9+ 已合并进 libstdc++，不需要。
+if (COMPILER_TARGET STREQUAL "arm32")
+    target_link_libraries(${PROJECT_NAME} PRIVATE stdc++fs)
+endif ()
+
+find_package(Threads REQUIRED)
     target_link_libraries(${PROJECT_NAME} PRIVATE Threads::Threads rt dl m)
 endif ()
 
@@ -155,6 +161,12 @@ if (UDT_SOURCE_DIR)
     set(UDT_BUILD_SHARED OFF CACHE BOOL "" FORCE)
     set(UDT_BUILD_STATIC ON CACHE BOOL "" FORCE)
     add_subdirectory("${UDT_SOURCE_DIR}" "${CMAKE_BINARY_DIR}/udt4" EXCLUDE_FROM_ALL)
+    # Windows 交叉构建：WIN32 宏必须传到 UDT 子项目，否则 udt.h 会走 POSIX
+    # 分支去找 sys/socket.h 之类 Linux 头文件，编译直接失败。
+    if (TARGET_OS STREQUAL "windows")
+        target_compile_definitions(udt_static PRIVATE WIN32 _WIN32 _WIN32_WINNT=0x0600 UDT_STATIC __MINGW__)
+        target_compile_options(udt_static PRIVATE -fpermissive)
+    endif ()
     target_link_libraries(${PROJECT_NAME} PRIVATE udt_static)
 else ()
     find_library(UDT_LIBRARY NAMES udt udt4 PATHS /usr/lib /usr/local/lib /usr/lib/x86_64-linux-gnu)

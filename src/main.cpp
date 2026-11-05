@@ -27,7 +27,18 @@
 #include <vector>
 #include <string>
 #include <chrono>
+// GCC 7 的 <filesystem> 还是实验性实现，要换 <experimental/filesystem>
+// 并额外链接 -lstdc++fs（老 Linaro arm32 工具链就是这个情况）。
+// 注意 llvm-mingw（clang + libc++）会伪装 __GNUC__=4，但它没有
+// <experimental/filesystem>，所以必须用 _LIBCPP_VERSION 排除掉。
+// GCC 9+ 直接用正式版，不进这个分支。
+#if defined(__GNUC__) && __GNUC__ < 9 && !defined(_LIBCPP_VERSION)
+#include <experimental/filesystem>
+namespace fs = std::experimental::filesystem;
+#else
 #include <filesystem>
+namespace fs = std::filesystem;
+#endif
 #include <iomanip>
 #include <cmath>
 #include <algorithm>
@@ -65,7 +76,9 @@
 #include "json.hpp"
 
 using json = nlohmann::json;
+#if !defined(__GNUC__) || __GNUC__ >= 9
 namespace fs = std::filesystem;
+#endif
 
 // ============================ 常量 ============================
 
